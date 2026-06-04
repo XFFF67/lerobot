@@ -115,6 +115,28 @@ lerobot-teleoperate \
     --teleop.right_arm_config.port=can0 \
     --teleop.id=my_bimanual_hyleader
 
+# 跟随模式 + 主臂 Pinocchio 重力补偿示例
+# 先从小 scale 开始；如果某个关节方向反了，把对应 signs 从 1.0 改成 -1.0。
+lerobot-teleoperate \
+    --robot.type=bi_openarm_follower \
+    --robot.left_arm_config.port=can2 \
+    --robot.left_arm_config.use_can_fd=true \
+    --robot.left_arm_config.side=left \
+    --robot.right_arm_config.port=can3 \
+    --robot.right_arm_config.use_can_fd=true \
+    --robot.right_arm_config.side=right \
+    --robot.id=my_bimanual_follower \
+    --teleop.type=bi_hyopenarm_leader \
+    --teleop.left_arm_config.port=can1 \
+    --teleop.right_arm_config.port=can0 \
+    --teleop.gravity_compensation_enabled=true \
+    --teleop.gravity_compensation_urdf_path=/tmp/v10_bimanual.urdf \
+    --teleop.gravity_compensation_scale=0.2 \
+    --teleop.gravity_compensation_torque_limit=0.5 \
+    --teleop.left_gravity_compensation_signs='[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]' \
+    --teleop.right_gravity_compensation_signs='[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]' \
+    --teleop.id=my_bimanual_hyleader
+
 # hugging face
 export http_proxy=http://127.0.0.1:7890
 export https_proxy=http://127.0.0.1:7890

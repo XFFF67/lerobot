@@ -86,6 +86,8 @@ class HyOpenArmLeader(Teleoperator):
             "robstride": self.robstride_bus,
             "damiao": self.damiao_bus,
         }
+        self._motor_names = list(self.config.motor_config)
+        self._validate_gravity_compensation_config()
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -174,7 +176,7 @@ class HyOpenArmLeader(Teleoperator):
         print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
-        if self.config.manual_control:
+        if self.config.manual_control and not self.config.gravity_compensation_enabled:
             self.robstride_bus.disable_torque()
             self.damiao_bus.disable_torque()
             return
@@ -198,19 +200,63 @@ class HyOpenArmLeader(Teleoperator):
         bus_name = self.motor_to_bus_name[motor_name]
         return self.buses[bus_name]
 
-    @check_if_not_connected
-    def get_action(self) -> RobotAction:
-        start = time.perf_counter()
-        action_dict: dict[str, Any] = {}
+    def _validate_gravity_compensation_config(self) -> None:
+        if self.config.gravity_compensation_torque_limit < 0:
+            raise ValueError("gravity_compensation_torque_limit must be >= 0.")
 
+    def _clamp_compensation_torque(self, torque: float) -> float:
+        torque_limit = self.config.gravity_compensation_torque_limit
+        return max(-torque_limit, min(torque_limit, torque))
+
+    def apply_feedforward_torques(
+        self,
+        states: dict[str, dict[str, Any]],
+        torques: dict[str, float],
+    ) -> None:
+        if not self.config.gravity_compensation_enabled:
+            return
+
+        commands_by_bus: dict[str, dict[str, tuple[float, float, float, float, float]]] = {
+            "robstride": {},
+            "damiao": {},
+        }
+        for motor_name, torque in torques.items():
+            state = states.get(motor_name, {})
+            position = state.get("position")
+            if position is None:
+                continue
+
+            bus_name = self.motor_to_bus_name[motor_name]
+            commands_by_bus[bus_name][motor_name] = (
+                0.0,
+                0.0,
+                float(position),
+                0.0,
+                self._clamp_compensation_torque(float(torque)),
+            )
+
+        if commands_by_bus["robstride"]:
+            self.robstride_bus._mit_control_batch(commands_by_bus["robstride"])
+        if commands_by_bus["damiao"]:
+            self.damiao_bus._mit_control_batch(commands_by_bus["damiao"])
+
+    def read_all_states(self) -> dict[str, dict[str, Any]]:
         robstride_states = self.robstride_bus.sync_read_all_states() if self.robstride_bus.motors else {}
         damiao_states = self.damiao_bus.sync_read_all_states() if self.damiao_bus.motors else {}
 
         all_states = {}
         all_states.update(robstride_states)
         all_states.update(damiao_states)
+        return all_states
 
-        for motor_name in self.config.motor_config:
+    @check_if_not_connected
+    def get_action(self) -> RobotAction:
+        start = time.perf_counter()
+        action_dict: dict[str, Any] = {}
+
+        all_states = self.read_all_states()
+
+        for motor_name in self._motor_names:
             state = all_states.get(motor_name, {})
             action_dict[f"{motor_name}.pos"] = state.get("position")
             # pos = state.get("position")
