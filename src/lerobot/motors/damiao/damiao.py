@@ -220,24 +220,26 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_id = self._get_motor_id(motor_name)
             recv_id = self._get_motor_recv_id(motor_name)
 
-            # Send enable command
             data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, CAN_CMD_ENABLE]
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
-            self.canbus.send(msg)
 
-            # Wait for response with longer timeout
             response = None
-            start_time = time.time()
-            while time.time() - start_time < 0.1:
-                response = self.canbus.recv(timeout=0.1)
-                if response and response.arbitration_id == recv_id:
+            for _ in range(3):
+                self.canbus.send(msg)
+
+                start_time = time.time()
+                while time.time() - start_time < LONG_TIMEOUT_SEC:
+                    candidate = self.canbus.recv(timeout=LONG_TIMEOUT_SEC)
+                    if candidate and candidate.arbitration_id == recv_id:
+                        response = candidate
+                        break
+                if response is not None:
                     break
-                response = None
 
             if response is None:
                 missing_motors.append(motor_name)
             else:
-                self._process_response(motor_name, msg)
+                self._process_response(motor_name, response)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:

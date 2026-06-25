@@ -116,7 +116,11 @@ class SyncInferenceEngine(InferenceEngine):
             action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
 
-        # Reorder to match dataset action ordering so the caller can treat
-        # the returned tensor uniformly across backends.
-        action_dict = make_robot_action(action_tensor, self._dataset_features)
+        policy_action_names = getattr(self._policy.config, "action_feature_names", None)
+        if policy_action_names is not None and len(policy_action_names) == len(action_tensor):
+            action_dict = {name: float(action_tensor[i]) for i, name in enumerate(policy_action_names)}
+        else:
+            # Fallback for policies whose output dimension already matches the
+            # robot action feature set.
+            action_dict = make_robot_action(action_tensor, self._dataset_features)
         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])

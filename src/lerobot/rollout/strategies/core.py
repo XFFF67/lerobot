@@ -296,9 +296,19 @@ def send_next_action(
     if interp is None:
         return None
 
-    if len(interp) != len(ordered_keys):
-        raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
-    action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
+    if len(interp) == len(ordered_keys):
+        action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
+    else:
+        policy_action_names = getattr(ctx.runtime.cfg.policy, "action_feature_names", None)
+        if policy_action_names is None or len(policy_action_names) != len(interp):
+            raise ValueError(
+                f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})"
+            )
+        action_by_name = {name: interp[i].item() for i, name in enumerate(policy_action_names)}
+        missing = [key for key in ordered_keys if key not in action_by_name]
+        if missing:
+            raise ValueError(f"Policy action output is missing robot action keys: {missing}")
+        action_dict = {key: action_by_name[key] for key in ordered_keys}
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
     ctx.hardware.robot_wrapper.send_action(processed)
     return action_dict

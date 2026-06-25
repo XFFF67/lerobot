@@ -103,6 +103,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .bi_openarm_mini import BiOpenArmMini
 
         return BiOpenArmMini(config)
+    elif config.type == "hyopenarm_leader":
+        from .hyopenarm_leader import HyOpenArmLeader
+
+        return HyOpenArmLeader(config)
+    elif config.type == "bi_hyopenarm_leader":
+        from .bi_hyopenarm_leader import BiHyOpenArmLeader
+
+        return BiHyOpenArmLeader(config)
     elif config.type == "rebot_102_leader":
         from .rebot_102_leader import RebotArm102Leader
 
