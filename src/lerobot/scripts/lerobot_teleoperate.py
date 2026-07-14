@@ -182,7 +182,13 @@ def teleop_loop(
 
         # Process action for robot through pipeline
         robot_action_to_send = robot_action_processor((teleop_action, obs))
-
+        # Invert left/right joint_1 ~ joint_4
+        for side in ("left", "right"):
+            for joint_idx in range(1, 5):
+                for field in ("pos", "vel", "torque"):
+                    key = f"{side}_joint_{joint_idx}.{field}"
+                    if key in robot_action_to_send:
+                        robot_action_to_send[key] = -robot_action_to_send[key]
         # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
         _ = robot.send_action(robot_action_to_send)
 

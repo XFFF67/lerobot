@@ -17,11 +17,11 @@ for can_port in can0 can1 can2 can3; do
     sudo ip link set $can_port txqueuelen 1000
 done
 
-lerobot-setup-can --mode=setup --interfaces=can0,can1
+lerobot-setup-can --mode=setup --interfaces=can0,can1 --use_fd=false
 lerobot-setup-can --mode=setup --interfaces=can2,can3 --use_fd=true
 
 # 测试电机通信
-lerobot-setup-can --mode=test --interfaces=can0,can1
+lerobot-setup-can --mode=test --interfaces=can0,can1 --use_fd=false
 lerobot-setup-can --mode=test --interfaces=can2,can3 --use_fd=true
 
 # 主臂标定
@@ -140,6 +140,20 @@ lerobot-teleoperate \
     --teleop.id=my_bimanual_hyleader
     --display_data=true
 
+
+lerobot-teleoperate \
+    --robot.type=bi_openarm_follower \
+    --robot.left_arm_config.port=can2 \
+    --robot.left_arm_config.use_can_fd=true \
+    --robot.left_arm_config.side=left \
+    --robot.right_arm_config.port=can3 \
+    --robot.right_arm_config.use_can_fd=true \
+    --robot.right_arm_config.side=right \
+    --robot.id=my_bimanual_follower \
+    --teleop.type=bi_hyopenarm_leader \
+    --teleop.left_arm_config.port=can1 \
+    --teleop.right_arm_config.port=can0 \
+    --teleop.id=my_bimanual_hyleader
 # hugging face
 export http_proxy=http://127.0.0.1:7890
 export https_proxy=http://127.0.0.1:7890
