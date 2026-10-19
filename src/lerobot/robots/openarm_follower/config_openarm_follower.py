@@ -54,6 +54,7 @@ class OpenArmFollowerConfigBase:
 
     # side of the arm: "left" or "right". If "None" default values will be used
     side: str | None = None
+
     # CAN interface type: "socketcan" (Linux), "slcan" (serial), or "auto" (auto-detect)
     can_interface: str = "socketcan"
 
@@ -64,6 +65,9 @@ class OpenArmFollowerConfigBase:
 
     # Whether to disable torque when disconnecting
     disable_torque_on_disconnect: bool = True
+
+    # When True, expose `.vel` and `.torque` per motor in observation/action features.
+    use_velocity_and_torque: bool = True
 
     # Safety limit for relative target positions
     # Set to a positive scalar for all motors, or a dict mapping motor names to limits
@@ -95,10 +99,11 @@ class OpenArmFollowerConfigBase:
     # MIT control parameters for position control (used in send_action)
     # List of 8 values: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, joint_7, gripper]
     position_kp: list[float] = field(
-        #default_factory=lambda: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0, 25.0]
+        # default_factory=lambda: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0, 25.0]
         default_factory=lambda: [50.0, 50.0, 50.0, 50.0, 25.0, 8.0, 8.0, 8.0]
     )
-    #position_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3, 0.3])
+    
+    # position_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3, 0.3])
     position_kd: list[float] = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.5, 0.2, 0.2, 0.2])
 
     # Values for joint limits. Can be overridden via CLI (for custom values) or by setting config.side to either 'left' or 'right'.

@@ -15,6 +15,8 @@
 """
 Simple script to control a robot from teleoperation.
 
+Requires: pip install 'lerobot[hardware]'
+
 Example:
 
 ```shell
@@ -56,10 +58,9 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-import rerun as rr
-
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,
@@ -71,15 +72,17 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_openarm_follower,
+    bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
     make_robot_from_config,
     omx_follower,
-    openarm_follower,
     hyopenarm_follower,
+    openarm_follower,
     reachy2,
+    rebot_b601_follower,
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
@@ -87,6 +90,8 @@ from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_openarm_leader,
+    bi_openarm_mini,
+    bi_rebot_102_leader,
     bi_so_leader,
     gamepad,
     homunculus,
@@ -94,18 +99,19 @@ from lerobot.teleoperators import (  # noqa: F401
     koch_leader,
     make_teleoperator_from_config,
     omx_leader,
+    bi_hyopenarm_leader,
+    hyopenarm_leader,
     openarm_leader,
     openarm_mini,
-    hyopenarm_leader,
     reachy2_teleoperator,
+    rebot_102_leader,
     so_leader,
     unitree_g1,
-    bi_hyopenarm_leader,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
 
 @dataclass
@@ -114,7 +120,7 @@ class TeleoperateConfig:
     teleop: TeleoperatorConfig
     robot: RobotConfig
     # Limit the maximum frames per second.
-    fps: int = 60  ##
+    fps: int = 60
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
@@ -156,7 +162,6 @@ def teleop_loop(
 
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
-
     while True:
         loop_start = time.perf_counter()
 
@@ -166,20 +171,15 @@ def teleop_loop(
         # given that it is the identity processor as default
         obs = robot.get_observation()
 
+        if robot.name == "unitree_g1":
+            teleop.send_feedback(obs)
+
         # Get teleop action
         raw_action = teleop.get_action()
-        # print("\n================ obs ================")
-        # print(type(obs))
-        # print(obs)
 
-        # print("\n================ raw_action ================")
-        # print(type(raw_action))
-        # print(raw_action)
         # Process teleop action through pipeline
         teleop_action = teleop_action_processor((raw_action, obs))
-        # print("\n================ teleop_action ================")
-        # print(type(teleop_action))
-        # print(teleop_action)
+
         # Process action for robot through pipeline
         robot_action_to_send = robot_action_processor((teleop_action, obs))
         # Invert left/right joint_1 ~ joint_4
@@ -189,26 +189,7 @@ def teleop_loop(
                     key = f"{side}_joint_{joint_idx}.{field}"
                     if key in robot_action_to_send:
                         robot_action_to_send[key] = -robot_action_to_send[key]
-        # print("\n================ robot_action_to_send ================")
-        # print(type(robot_action_to_send))
-        # print(robot_action_to_send)
         # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        #-------------------debug--------------------------------
-        # if not hasattr(robot_action_processor, "_dumped_robot_action_once"):
-        #     from pprint import pformat
-
-        #     dump_path = f"/tmp/robot_action_to_send_{int(time.time())}.txt"
-
-        #     with open(dump_path, "w", encoding="utf-8") as f:
-        #         f.write("================ robot_action_to_send ================\n")
-        #         f.write(f"type: {type(robot_action_to_send)}\n\n")
-        #         f.write(pformat(robot_action_to_send, width=160, sort_dicts=False))
-        #         f.write("\n======================================================\n")
-
-        #     print(f"\n[DEBUG] Full robot_action_to_send dumped to: {dump_path}\n")
-        #     robot_action_processor._dumped_robot_action_once = True
-
-        print(robot_action_to_send)
         _ = robot.send_action(robot_action_to_send)
 
         if display_data:
@@ -273,7 +254,7 @@ def teleoperate(cfg: TeleoperateConfig):
         pass
     finally:
         if cfg.display_data:
-            rr.rerun_shutdown()
+            shutdown_rerun()
         teleop.disconnect()
         robot.disconnect()
 

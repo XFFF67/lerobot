@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mobile OpenArm VR</title>
+<style>
+body { background: #101b2b; color: #eaf4ff; font: 20px/1.65 system-ui; max-width: 780px; margin: 6vh auto; padding: 24px; }
+h1 { font-size: 36px; margin-bottom: 12px; }
+button { font: inherit; padding: 14px 24px; border: 0; border-radius: 10px; background: #5ddbc0; color: #102325; margin: 8px 12px 8px 0; cursor: pointer; }
+button:disabled { opacity: .45; }
+#status { background: #1e3049; padding: 16px; border-radius: 10px; }
+li { margin: 10px 0; }
+canvas { display: none; }
+</style>
+<h1>Mobile OpenArm VR</h1>
+<p>双臂 · 升降 · 轮式底盘仿真</p>
+<p id="status">正在检查头显与连接…</p>
+<pre id="diagnostics" style="white-space:pre-wrap;font-size:15px">等待 XR 状态…</pre>
+<button id="enter" disabled>进入 VR</button>
+<button id="passthrough" disabled>进入透视模式</button>
+<button id="exit" disabled>退出控制</button>
+<ul>
+  <li>连接后先松开两侧握把，再按住对应握把，移动或旋转手柄控制手臂。</li>
+  <li>握把按住时：扳机张开夹爪，松开扳机闭合；松开握把保持当前状态。</li>
+  <li>右握把 + 右摇杆上下：沿当前轮向行驶；右摇杆左右不控制转轮。</li>
+  <li>右握把按住、左握把松开 + 左摇杆左右：调整轮向。</li>
+  <li>左握把按住 + 左摇杆上下：升降，此时左摇杆不控制轮向。</li>
+  <li>右握把 + B / Y：顺时针 / 逆时针自转。按住按键等待轮组切换完成。</li>
+  <li>右握把 + 右摇杆按下：切回平移并回正轮组。握把松开时 X / A 复位对应手臂。</li>
+</ul>
+<p>在电脑 MuJoCo 窗口观察机器人。此页面不传输仿真相机画面；透视模式可用于看电脑屏幕（取决于头显支持）。</p>
+<p>面向电脑，松开握把、摇杆回中后长按右手柄 Meta 按钮约 3 秒重新居中，再开始控制。</p>
+<canvas id="view"></canvas>
+<script src="/vr.js"></script>
+</html>

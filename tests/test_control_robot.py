@@ -16,13 +16,39 @@
 
 from unittest.mock import patch
 
+import pytest
+
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[hardware])")
+
+from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
-from lerobot.scripts.lerobot_record import DatasetRecordConfig, RecordConfig, record
+from lerobot.scripts.lerobot_record import RecordConfig, _invert_bi_openarm_follower_action, record
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
+
+
+def test_bi_openarm_record_action_inverts_leader_joint_coordinates():
+    action = {
+        "left_joint_1.pos": 1.0,
+        "left_joint_4.vel": -2.0,
+        "left_joint_5.pos": 3.0,
+        "right_joint_2.torque": 4.0,
+        "right_joint_4.pos": None,
+        "right_joint_7.pos": 5.0,
+    }
+
+    inverted = _invert_bi_openarm_follower_action(action)
+
+    assert inverted["left_joint_1.pos"] == -1.0
+    assert inverted["left_joint_4.vel"] == 2.0
+    assert inverted["right_joint_2.torque"] == -4.0
+    assert inverted["right_joint_4.pos"] is None
+    assert inverted["left_joint_5.pos"] == 3.0
+    assert inverted["right_joint_7.pos"] == 5.0
 
 
 def test_calibrate():
@@ -71,8 +97,8 @@ def test_record_and_resume(tmp_path):
     cfg.resume = True
     # Mock the revision to prevent Hub calls during resume
     with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
     ):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record")
@@ -115,8 +141,8 @@ def test_record_and_replay(tmp_path):
 
     # Mock the revision to prevent Hub calls during replay
     with (
-        patch("lerobot.datasets.lerobot_dataset.get_safe_version") as mock_get_safe_version,
-        patch("lerobot.datasets.lerobot_dataset.snapshot_download") as mock_snapshot_download,
+        patch("lerobot.datasets.dataset_metadata.get_safe_version") as mock_get_safe_version,
+        patch("lerobot.datasets.dataset_metadata.snapshot_download") as mock_snapshot_download,
     ):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")

@@ -14,10 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import math
-from pathlib import Path
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 from lerobot.processor import RobotAction
@@ -75,8 +76,8 @@ class BiHyOpenArmLeader(Teleoperator):
             gravity_compensation_torque_limit=config.gravity_compensation_torque_limit,
         )
 
-        self.left_arm = HyOpenArmLeader(left_arm_config)
-        self.right_arm = HyOpenArmLeader(right_arm_config)
+        self.left_arm = HyOpenArmLeader(left_arm_config, gravity_compensation_managed_externally=True)
+        self.right_arm = HyOpenArmLeader(right_arm_config, gravity_compensation_managed_externally=True)
         self._motor_names = list(left_arm_config.motor_config)
         self._pin = None
         self._pin_model = None
@@ -84,6 +85,7 @@ class BiHyOpenArmLeader(Teleoperator):
         self._pin_q = None
         self._left_pin_indices: dict[str, tuple[int, int]] = {}
         self._right_pin_indices: dict[str, tuple[int, int]] = {}
+        self._gravity_compensation_diagnostics: dict[str, dict[str, dict[str, float | bool]]] = {}
         self._validate_gravity_compensation_config()
     
      @cached_property
@@ -107,8 +109,16 @@ class BiHyOpenArmLeader(Teleoperator):
      @check_if_already_connected
      def connect(self, calibrate: bool = True) -> None:
         self._setup_pinocchio_gravity_compensation()
-        self.left_arm.connect(calibrate)
-        self.right_arm.connect(calibrate)
+        try:
+            self.left_arm.connect(calibrate)
+            self.right_arm.connect(calibrate)
+            self._stop_gravity_compensation()
+        except Exception:
+            if self.left_arm.is_connected:
+                self.left_arm.disconnect()
+            if self.right_arm.is_connected:
+                self.right_arm.disconnect()
+            raise
 
      @property
      def is_calibrated(self) -> bool:
@@ -129,11 +139,15 @@ class BiHyOpenArmLeader(Teleoperator):
 
      @check_if_not_connected
      def get_action(self) -> RobotAction:
-        action_dict = {}
+        action_dict: dict[str, Any] = {}
 
-        left_states = self.left_arm.read_all_states()
-        right_states = self.right_arm.read_all_states()
-        self._apply_pinocchio_gravity_compensation(left_states, right_states)
+        try:
+            left_states = self.left_arm.read_all_states()
+            right_states = self.right_arm.read_all_states()
+            self._apply_pinocchio_gravity_compensation(left_states, right_states)
+        except Exception:
+            self._stop_gravity_compensation()
+            raise
 
         action_dict.update(self._states_to_action("left", left_states))
         action_dict.update(self._states_to_action("right", right_states))
@@ -141,23 +155,87 @@ class BiHyOpenArmLeader(Teleoperator):
         return action_dict
 
      def _validate_gravity_compensation_config(self) -> None:
-        if self.config.gravity_compensation_torque_limit < 0:
-            raise ValueError("gravity_compensation_torque_limit must be >= 0.")
+        scalar_fields = (
+            "gravity_compensation_scale",
+            "gravity_compensation_torque_limit",
+            "gravity_compensation_max_feedback_age_s",
+        )
+        for field_name in scalar_fields:
+            value = getattr(self.config, field_name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} must be finite and >= 0.")
+        if self.config.gravity_compensation_max_feedback_age_s == 0:
+            raise ValueError("gravity_compensation_max_feedback_age_s must be > 0.")
 
-        for field_name in (
+        list_fields = (
             "left_pinocchio_joint_names",
             "right_pinocchio_joint_names",
+            "left_gravity_compensation_angle_signs",
+            "right_gravity_compensation_angle_signs",
+            "left_gravity_compensation_zero_offsets_deg",
+            "right_gravity_compensation_zero_offsets_deg",
+            "left_gravity_compensation_damping",
+            "right_gravity_compensation_damping",
             "left_gravity_compensation_signs",
             "right_gravity_compensation_signs",
-        ):
+        )
+        for field_name in list_fields:
             values = getattr(self.config, field_name)
             if len(values) != 7:
                 raise ValueError(f"{field_name} must contain 7 values for joint_1 ... joint_7.")
+
+        optional_nonnegative_list_fields = (
+            "left_gravity_compensation_scales",
+            "right_gravity_compensation_scales",
+            "left_gravity_compensation_torque_limits",
+            "right_gravity_compensation_torque_limits",
+        )
+        for field_name in optional_nonnegative_list_fields:
+            values = getattr(self.config, field_name)
+            if values is None:
+                continue
+            if len(values) != 7:
+                raise ValueError(f"{field_name} must contain 7 values for joint_1 ... joint_7.")
+            if any(not math.isfinite(value) or value < 0 for value in values):
+                raise ValueError(f"Every value in {field_name} must be finite and >= 0.")
+
+        sign_fields = (
+            "left_gravity_compensation_angle_signs",
+            "right_gravity_compensation_angle_signs",
+            "left_gravity_compensation_signs",
+            "right_gravity_compensation_signs",
+        )
+        for field_name in sign_fields:
+            if any(
+                not math.isfinite(value) or abs(value) != 1.0
+                for value in getattr(self.config, field_name)
+            ):
+                raise ValueError(f"Every value in {field_name} must be either -1 or 1.")
+
+        offset_fields = (
+            "left_gravity_compensation_zero_offsets_deg",
+            "right_gravity_compensation_zero_offsets_deg",
+        )
+        for field_name in offset_fields:
+            if any(not math.isfinite(value) for value in getattr(self.config, field_name)):
+                raise ValueError(f"Every value in {field_name} must be finite.")
+
+        damping_fields = (
+            "left_gravity_compensation_damping",
+            "right_gravity_compensation_damping",
+        )
+        for field_name in damping_fields:
+            if any(not math.isfinite(value) or value < 0 for value in getattr(self.config, field_name)):
+                raise ValueError(f"Every value in {field_name} must be finite and >= 0.")
 
      def _setup_pinocchio_gravity_compensation(self) -> None:
         if not self.config.gravity_compensation_enabled:
             return
 
+        if not self.config.gravity_compensation_urdf_path:
+            raise ValueError(
+                "gravity_compensation_urdf_path is required when gravity compensation is enabled."
+            )
         urdf_path = Path(self.config.gravity_compensation_urdf_path).expanduser()
         if not urdf_path.exists():
             raise FileNotFoundError(f"Pinocchio gravity compensation URDF not found: {urdf_path}")
@@ -188,7 +266,10 @@ class BiHyOpenArmLeader(Teleoperator):
 
             joint = self._pin_model.joints[joint_id]
             if joint.nq != 1 or joint.nv != 1:
-                raise ValueError(f"Joint '{pin_joint_name}' must have nq=1 and nv=1, got nq={joint.nq}, nv={joint.nv}.")
+                raise ValueError(
+                    f"Joint '{pin_joint_name}' must have nq=1 and nv=1, "
+                    f"got nq={joint.nq}, nv={joint.nv}."
+                )
             indices[motor_name] = (joint.idx_q, joint.idx_v)
         return indices
 
@@ -202,30 +283,112 @@ class BiHyOpenArmLeader(Teleoperator):
         return action_dict
 
      def _fill_pinocchio_q(
-        self,
-        q,
-        states: dict[str, dict[str, Any]],
-        indices: dict[str, tuple[int, int]],
+         self,
+         q,
+         states: dict[str, dict[str, Any]],
+         indices: dict[str, tuple[int, int]],
+         angle_signs: list[float],
+         zero_offsets_deg: list[float],
      ) -> None:
-        for motor_name, (idx_q, _) in indices.items():
+        for motor_name, angle_sign, zero_offset_deg in zip(
+            self._motor_names[:7], angle_signs, zero_offsets_deg, strict=True
+        ):
+            idx_q, _ = indices[motor_name]
             position = states.get(motor_name, {}).get("position")
             if position is None:
-                continue
-            q[idx_q] = math.radians(float(position))
+                raise RuntimeError(
+                    f"Missing position feedback for gravity compensation motor '{motor_name}'."
+                )
+            position = float(position)
+            if not math.isfinite(position):
+                raise RuntimeError(
+                    f"Non-finite position feedback for gravity compensation motor '{motor_name}'."
+                )
+            q[idx_q] = float(angle_sign) * math.radians(position - float(zero_offset_deg))
 
      def _extract_pinocchio_torques(
         self,
-        gravity,
-        indices: dict[str, tuple[int, int]],
-        signs: list[float],
+         gravity,
+         indices: dict[str, tuple[int, int]],
+         states: dict[str, dict[str, Any]],
+         torque_signs: list[float],
+         angle_signs: list[float],
+         damping: list[float],
+         scales: list[float] | None = None,
      ) -> dict[str, float]:
         torques: dict[str, float] = {}
-        for motor_name, sign in zip(self._motor_names[:7], signs, strict=True):
+        joint_scales = scales or [self.config.gravity_compensation_scale] * 7
+        for motor_name, torque_sign, angle_sign, damping_coefficient, scale in zip(
+            self._motor_names[:7], torque_signs, angle_signs, damping, joint_scales, strict=True
+        ):
             _, idx_v = indices[motor_name]
-            torques[motor_name] = float(sign) * self.config.gravity_compensation_scale * float(gravity[idx_v])
+            velocity = states.get(motor_name, {}).get("velocity")
+            if velocity is None:
+                raise RuntimeError(
+                    f"Missing velocity feedback for gravity compensation motor '{motor_name}'."
+                )
+            velocity = float(velocity)
+            if not math.isfinite(velocity):
+                raise RuntimeError(
+                    f"Non-finite velocity feedback for gravity compensation motor '{motor_name}'."
+                )
+            model_velocity = float(angle_sign) * math.radians(velocity)
+            model_torque = (
+                float(scale) * float(gravity[idx_v])
+                - float(damping_coefficient) * model_velocity
+            )
+            torques[motor_name] = float(torque_sign) * model_torque
 
-        torques["gripper"] = 0.0
         return torques
+
+     def _build_gravity_compensation_diagnostics(
+        self,
+        gravity,
+        indices: dict[str, tuple[int, int]],
+        states: dict[str, dict[str, Any]],
+        torque_signs: list[float],
+        angle_signs: list[float],
+        damping: list[float],
+        scales: list[float],
+        torque_limits: list[float],
+        torques: dict[str, float],
+     ) -> dict[str, dict[str, float | bool]]:
+        """Describe each gravity-compensation term in motor coordinates."""
+        diagnostics: dict[str, dict[str, float | bool]] = {}
+        for motor_name, torque_sign, angle_sign, damping_coefficient, scale, torque_limit in zip(
+            self._motor_names[:7],
+            torque_signs,
+            angle_signs,
+            damping,
+            scales,
+            torque_limits,
+            strict=True,
+        ):
+            _, idx_v = indices[motor_name]
+            velocity = float(states[motor_name]["velocity"])
+            model_velocity = float(angle_sign) * math.radians(velocity)
+            raw_gravity_torque = float(torque_sign) * float(gravity[idx_v])
+            scaled_gravity_torque = float(scale) * raw_gravity_torque
+            damping_torque = float(torque_sign) * (-float(damping_coefficient) * model_velocity)
+            unclamped_torque = float(torques[motor_name])
+            limited_torque = max(-float(torque_limit), min(float(torque_limit), unclamped_torque))
+
+            diagnostics[motor_name] = {
+                "raw_gravity_torque": raw_gravity_torque,
+                "scaled_gravity_torque": scaled_gravity_torque,
+                "damping_torque": damping_torque,
+                "unclamped_torque": unclamped_torque,
+                "limited_torque": limited_torque,
+                "torque_limit": float(torque_limit),
+                "is_limited": abs(unclamped_torque) > float(torque_limit),
+            }
+
+        return diagnostics
+
+     @property
+     def gravity_compensation_diagnostics(self) -> dict[str, dict[str, dict[str, float | bool]]]:
+        """Latest torque terms, expressed in motor coordinates and N·m."""
+        return self._gravity_compensation_diagnostics
 
      def _apply_pinocchio_gravity_compensation(
         self,
@@ -237,20 +400,103 @@ class BiHyOpenArmLeader(Teleoperator):
         if self._pin is None or self._pin_model is None or self._pin_data is None or self._pin_q is None:
             raise RuntimeError("Pinocchio gravity compensation is enabled but the model is not initialized.")
 
+        compensation_motors = self._motor_names[:7]
+        self.left_arm.assert_feedback_fresh(
+            self.config.gravity_compensation_max_feedback_age_s, compensation_motors, left_states
+        )
+        self.right_arm.assert_feedback_fresh(
+            self.config.gravity_compensation_max_feedback_age_s, compensation_motors, right_states
+        )
+
         q = self._pin_q.copy()
-        self._fill_pinocchio_q(q, left_states, self._left_pin_indices)
-        self._fill_pinocchio_q(q, right_states, self._right_pin_indices)
+        self._fill_pinocchio_q(
+            q,
+            left_states,
+            self._left_pin_indices,
+            self.config.left_gravity_compensation_angle_signs,
+            self.config.left_gravity_compensation_zero_offsets_deg,
+        )
+        self._fill_pinocchio_q(
+            q,
+            right_states,
+            self._right_pin_indices,
+            self.config.right_gravity_compensation_angle_signs,
+            self.config.right_gravity_compensation_zero_offsets_deg,
+        )
         gravity = self._pin.computeGeneralizedGravity(self._pin_model, self._pin_data, q)
 
+        left_scales = self.config.left_gravity_compensation_scales or [
+            self.config.gravity_compensation_scale
+        ] * 7
+        right_scales = self.config.right_gravity_compensation_scales or [
+            self.config.gravity_compensation_scale
+        ] * 7
+        left_torque_limits = self.config.left_gravity_compensation_torque_limits or [
+            self.config.gravity_compensation_torque_limit
+        ] * 7
+        right_torque_limits = self.config.right_gravity_compensation_torque_limits or [
+            self.config.gravity_compensation_torque_limit
+        ] * 7
+
         left_torques = self._extract_pinocchio_torques(
-            gravity, self._left_pin_indices, self.config.left_gravity_compensation_signs
+            gravity,
+            self._left_pin_indices,
+            left_states,
+            self.config.left_gravity_compensation_signs,
+            self.config.left_gravity_compensation_angle_signs,
+            self.config.left_gravity_compensation_damping,
+            left_scales,
         )
         right_torques = self._extract_pinocchio_torques(
-            gravity, self._right_pin_indices, self.config.right_gravity_compensation_signs
+            gravity,
+            self._right_pin_indices,
+            right_states,
+            self.config.right_gravity_compensation_signs,
+            self.config.right_gravity_compensation_angle_signs,
+            self.config.right_gravity_compensation_damping,
+            right_scales,
         )
 
-        self.left_arm.apply_feedforward_torques(left_states, left_torques)
-        self.right_arm.apply_feedforward_torques(right_states, right_torques)
+        self._gravity_compensation_diagnostics = {
+            "left": self._build_gravity_compensation_diagnostics(
+                gravity,
+                self._left_pin_indices,
+                left_states,
+                self.config.left_gravity_compensation_signs,
+                self.config.left_gravity_compensation_angle_signs,
+                self.config.left_gravity_compensation_damping,
+                left_scales,
+                left_torque_limits,
+                left_torques,
+            ),
+            "right": self._build_gravity_compensation_diagnostics(
+                gravity,
+                self._right_pin_indices,
+                right_states,
+                self.config.right_gravity_compensation_signs,
+                self.config.right_gravity_compensation_angle_signs,
+                self.config.right_gravity_compensation_damping,
+                right_scales,
+                right_torque_limits,
+                right_torques,
+            ),
+        }
+
+        compensation_motors = self._motor_names[:7]
+        self.left_arm.apply_feedforward_torques(
+            left_states, left_torques, dict(zip(compensation_motors, left_torque_limits, strict=True))
+        )
+        self.right_arm.apply_feedforward_torques(
+            right_states, right_torques, dict(zip(compensation_motors, right_torque_limits, strict=True))
+        )
+
+     def _stop_gravity_compensation(self) -> None:
+        if not self.config.gravity_compensation_enabled:
+            return
+        for arm in (self.left_arm, self.right_arm):
+            if arm.is_connected:
+                with contextlib.suppress(Exception):
+                    arm.stop_gravity_compensation()
 
      def send_feedback(self, feedback: dict[str, float]) -> None:
         # TODO: Implement force feedback
@@ -258,15 +504,9 @@ class BiHyOpenArmLeader(Teleoperator):
 
      @check_if_not_connected
      def disconnect(self) -> None:
+        self._stop_gravity_compensation()
         self.left_arm.disconnect()
         self.right_arm.disconnect()
-
-
-
-
-
-
-
 
 
 

@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from.config_hyopenarm_leader import HyOpenArmLeaderConfig, HyOpenArmLeaderConfigBase
+from .config_hyopenarm_leader import HyOpenArmLeaderConfig, HyOpenArmLeaderConfigBase
 from .hyopenarm_leader import HyOpenArmLeader
 
 __all__ = ["HyOpenArmLeader", "HyOpenArmLeaderConfig", "HyOpenArmLeaderConfigBase"]

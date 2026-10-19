@@ -68,14 +68,22 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .bi_openarm_follower import BiOpenArmFollower
 
         return BiOpenArmFollower(config)
-    elif config.type == "mock_robot":
-        from tests.mocks.mock_robot import MockRobot
+    elif config.type == "rebot_b601_follower":
+        from .rebot_b601_follower import RebotB601Follower
 
-        return MockRobot(config)
+        return RebotB601Follower(config)
+    elif config.type == "bi_rebot_b601_follower":
+        from .bi_rebot_b601_follower import BiRebotB601Follower
+
+        return BiRebotB601Follower(config)
     elif config.type == "hyopenarm_follower":
         from .hyopenarm_follower import HyOpenArmFollower
 
         return HyOpenArmFollower(config)
+    elif config.type == "mock_robot":
+        from tests.mocks.mock_robot import MockRobot
+
+        return MockRobot(config)
     else:
         try:
             return cast(Robot, make_device_from_device_class(config))

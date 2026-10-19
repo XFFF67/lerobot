@@ -1,0 +1,14 @@
+name: hei-rebot-vr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pinocchio=3.9.0
+  - casadi=3.7.0
+  - numpy
+  - pip
+  - pip:
+      - mujoco==3.5.0
+      - glfw
+      - pyzmq>=25
+      - websockets>=14,<17

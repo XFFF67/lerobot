@@ -24,7 +24,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
-from lerobot.utils.import_utils import _can_available
+from lerobot.utils.import_utils import _can_available, require_package
 
 if TYPE_CHECKING or _can_available:
     import can
@@ -111,6 +111,7 @@ class DamiaoMotorsBus(MotorsBusBase):
             bitrate: Nominal bitrate in bps (default: 1000000 = 1 Mbps)
             data_bitrate: Data bitrate for CAN FD in bps (default: 5000000 = 5 Mbps), ignored if use_can_fd is False
         """
+        require_package("python-can", extra="damiao", import_name="can")
         super().__init__(port, motors, calibration)
         self.port = port
         self.can_interface = can_interface
@@ -193,7 +194,7 @@ class DamiaoMotorsBus(MotorsBusBase):
             self._is_connected = True
 
             if handshake:
-                self._handshake()#在连接总线后，对电机进行握手（handshake）检查
+                self._handshake()
 
             logger.debug(f"{self.__class__.__name__} connected via {self.can_interface}.")
         except Exception as e:
@@ -219,24 +220,26 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_id = self._get_motor_id(motor_name)
             recv_id = self._get_motor_recv_id(motor_name)
 
-            # Send enable command
             data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, CAN_CMD_ENABLE]
             msg = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False, is_fd=self.use_can_fd)
-            self.canbus.send(msg)
 
-            # Wait for response with longer timeout
             response = None
-            start_time = time.time()
-            while time.time() - start_time < 0.1:
-                response = self.canbus.recv(timeout=0.1)
-                if response and response.arbitration_id == recv_id:
+            for _ in range(3):
+                self.canbus.send(msg)
+
+                start_time = time.time()
+                while time.time() - start_time < LONG_TIMEOUT_SEC:
+                    candidate = self.canbus.recv(timeout=LONG_TIMEOUT_SEC)
+                    if candidate and candidate.arbitration_id == recv_id:
+                        response = candidate
+                        break
+                if response is not None:
                     break
-                response = None
 
             if response is None:
                 missing_motors.append(motor_name)
             else:
-                self._process_response(motor_name, msg)
+                self._process_response(motor_name, response)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
@@ -350,7 +353,7 @@ class DamiaoMotorsBus(MotorsBusBase):
 
         self.canbus.send(msg)
         return self._recv_motor_response(expected_recv_id=recv_id)
-    #读取电机状态的函数，发送刷新命令并等待响应
+
     def _recv_motor_response(
         self, expected_recv_id: int | None = None, timeout: float = 0.001
     ) -> can.Message | None:

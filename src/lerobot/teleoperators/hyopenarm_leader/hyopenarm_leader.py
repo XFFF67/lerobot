@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -41,9 +42,12 @@ class HyOpenArmLeader(Teleoperator):
     config_class = HyOpenArmLeaderConfig
     name = "hyopenarm_leader"
 
-    def __init__(self, config: HyOpenArmLeaderConfig):
+    def __init__(
+        self, config: HyOpenArmLeaderConfig, *, gravity_compensation_managed_externally: bool = False
+    ):
         super().__init__(config)
         self.config = config
+        self._gravity_compensation_managed_externally = gravity_compensation_managed_externally
 
         robstride_motors: dict[str, Motor] = {}
         damiao_motors: dict[str, Motor] = {}
@@ -112,20 +116,28 @@ class HyOpenArmLeader(Teleoperator):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        logger.info(f"Connecting Robstride arm bus on {self.config.port}...")
-        self.robstride_bus.connect()
+        try:
+            logger.info(f"Connecting Robstride arm bus on {self.config.port}...")
+            self.robstride_bus.connect()
 
-        logger.info(f"Connecting Damiao arm bus on {self.config.port}...")
-        self.damiao_bus.connect()
+            logger.info(f"Connecting Damiao arm bus on {self.config.port}...")
+            self.damiao_bus.connect()
 
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+            if not self.is_calibrated and calibrate:
+                logger.info(
+                    "Mismatch between calibration values in the motor and the calibration file "
+                    "or no calibration file found"
+                )
+                self.calibrate()
 
-        self.configure()
-        logger.info(f"{self} connected.")
+            self.configure()
+            logger.info(f"{self} connected.")
+        except Exception:
+            if self.robstride_bus.is_connected:
+                self.robstride_bus.disconnect(disable_torque=True)
+            if self.damiao_bus.is_connected:
+                self.damiao_bus.disconnect(disable_torque=True)
+            raise
 
     def calibrate(self) -> None:
         if self.calibration:
@@ -191,6 +203,12 @@ class HyOpenArmLeader(Teleoperator):
             bus.write("Kp", motor_name, kp)
             bus.write("Kd", motor_name, kd)
 
+        # The gripper is manually operated and must not participate in arm
+        # gravity compensation, even though it shares the Damiao bus.
+        if self.config.manual_control and self.config.gravity_compensation_enabled:
+            gripper_bus = self._get_bus_for_motor("gripper")
+            gripper_bus.disable_torque("gripper")
+
     def setup_motors(self) -> None:
         raise NotImplementedError(
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
@@ -201,17 +219,75 @@ class HyOpenArmLeader(Teleoperator):
         return self.buses[bus_name]
 
     def _validate_gravity_compensation_config(self) -> None:
-        if self.config.gravity_compensation_torque_limit < 0:
-            raise ValueError("gravity_compensation_torque_limit must be >= 0.")
-
-    def _clamp_compensation_torque(self, torque: float) -> float:
         torque_limit = self.config.gravity_compensation_torque_limit
+        if not math.isfinite(torque_limit) or torque_limit < 0:
+            raise ValueError("gravity_compensation_torque_limit must be finite and >= 0.")
+        if (
+            self.config.gravity_compensation_enabled
+            and not self._gravity_compensation_managed_externally
+        ):
+            raise ValueError(
+                "Standalone hyopenarm_leader cannot enable gravity compensation. "
+                "Use bi_hyopenarm_leader, which owns the Pinocchio model and control loop."
+            )
+
+    def _clamp_compensation_torque(self, torque: float, torque_limit: float | None = None) -> float:
+        if not math.isfinite(torque):
+            raise ValueError(f"Refusing to send non-finite compensation torque: {torque}")
+        if torque_limit is None:
+            torque_limit = self.config.gravity_compensation_torque_limit
+        if not math.isfinite(torque_limit) or torque_limit < 0:
+            raise ValueError(f"Compensation torque limit must be finite and >= 0: {torque_limit}")
         return max(-torque_limit, min(torque_limit, torque))
+
+    def assert_feedback_fresh(
+        self,
+        max_age_s: float,
+        motors: list[str] | None = None,
+        states: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Reject missing or stale feedback before computing an open-loop torque."""
+        now = time.time()
+        target_motors = set(self._motor_names if motors is None else motors)
+        stale_motors: list[str] = []
+        missing_motors: list[str] = []
+        for bus in self.buses.values():
+            for motor_name in bus.motors:
+                if motor_name not in target_motors:
+                    continue
+                last_feedback_time = getattr(bus, "last_feedback_time", None)
+                if last_feedback_time is None:
+                    state = {} if states is None else states.get(motor_name, {})
+                    if state.get("position") is None or state.get("velocity") is None:
+                        missing_motors.append(motor_name)
+                    continue
+                timestamp = last_feedback_time.get(motor_name)
+                if timestamp is None or now - timestamp > max_age_s:
+                    stale_motors.append(motor_name)
+        if missing_motors:
+            raise RuntimeError(
+                "Gravity compensation feedback is missing position or velocity for: "
+                f"{', '.join(missing_motors)}"
+            )
+        if stale_motors:
+            raise RuntimeError(
+                f"Gravity compensation feedback is missing or older than {max_age_s:.3f}s for: "
+                f"{', '.join(stale_motors)}"
+            )
+
+    def _send_mit_commands(
+        self, commands_by_bus: dict[str, dict[str, tuple[float, float, float, float, float]]]
+    ) -> None:
+        if commands_by_bus["robstride"]:
+            self.robstride_bus._mit_control_batch(commands_by_bus["robstride"])
+        if commands_by_bus["damiao"]:
+            self.damiao_bus._mit_control_batch(commands_by_bus["damiao"])
 
     def apply_feedforward_torques(
         self,
         states: dict[str, dict[str, Any]],
         torques: dict[str, float],
+        torque_limits: dict[str, float] | None = None,
     ) -> None:
         if not self.config.gravity_compensation_enabled:
             return
@@ -221,24 +297,45 @@ class HyOpenArmLeader(Teleoperator):
             "damiao": {},
         }
         for motor_name, torque in torques.items():
+            if motor_name not in self.motor_to_bus_name:
+                raise ValueError(f"Unknown motor in gravity compensation command: {motor_name}")
             state = states.get(motor_name, {})
             position = state.get("position")
             if position is None:
-                continue
+                raise RuntimeError(
+                    f"Missing position feedback for gravity compensation motor '{motor_name}'."
+                )
+            if not math.isfinite(float(position)):
+                raise RuntimeError(
+                    f"Non-finite position feedback for gravity compensation motor '{motor_name}'."
+                )
 
             bus_name = self.motor_to_bus_name[motor_name]
+            torque_limit = None if torque_limits is None else torque_limits.get(motor_name)
+            if torque_limits is not None and torque_limit is None:
+                raise ValueError(f"Missing gravity compensation torque limit for '{motor_name}'.")
             commands_by_bus[bus_name][motor_name] = (
                 0.0,
                 0.0,
                 float(position),
                 0.0,
-                self._clamp_compensation_torque(float(torque)),
+                self._clamp_compensation_torque(float(torque), torque_limit),
             )
 
-        if commands_by_bus["robstride"]:
-            self.robstride_bus._mit_control_batch(commands_by_bus["robstride"])
-        if commands_by_bus["damiao"]:
-            self.damiao_bus._mit_control_batch(commands_by_bus["damiao"])
+        self._send_mit_commands(commands_by_bus)
+
+    def stop_gravity_compensation(self) -> None:
+        """Send zero feed-forward torque to every motor without relying on feedback."""
+        if not self.config.gravity_compensation_enabled:
+            return
+        commands_by_bus: dict[str, dict[str, tuple[float, float, float, float, float]]] = {
+            "robstride": {},
+            "damiao": {},
+        }
+        for motor_name in self._motor_names[:7]:
+            bus_name = self.motor_to_bus_name[motor_name]
+            commands_by_bus[bus_name][motor_name] = (0.0, 0.0, 0.0, 0.0, 0.0)
+        self._send_mit_commands(commands_by_bus)
 
     def read_all_states(self) -> dict[str, dict[str, Any]]:
         robstride_states = self.robstride_bus.sync_read_all_states() if self.robstride_bus.motors else {}
@@ -277,6 +374,7 @@ class HyOpenArmLeader(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self.robstride_bus.disconnect(disable_torque=self.config.manual_control)
-        self.damiao_bus.disconnect(disable_torque=self.config.manual_control)
+        disable_torque = self.config.manual_control or self.config.gravity_compensation_enabled
+        self.robstride_bus.disconnect(disable_torque=disable_torque)
+        self.damiao_bus.disconnect(disable_torque=disable_torque)
         logger.info(f"{self} disconnected.")

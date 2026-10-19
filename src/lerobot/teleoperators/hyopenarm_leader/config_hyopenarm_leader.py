@@ -67,10 +67,9 @@ class HyOpenArmLeaderConfigBase:
         default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.5, 0.2, 0.2, 0.2]
     )
 
-    # Optional torque feed-forward for manual leader arms. When enabled, the arm
-    # stays in MIT mode so a wrapper can send small compensation torques.
-    gravity_compensation_enabled: bool = False # 传给单臂底层，让它知道是否允许进入 MIT 力矩补偿模式
-    gravity_compensation_torque_limit: float = 1.0 # 单臂实际发力矩前会用这个值做限幅
+    # Gravity compensation is computed by the bimanual wrapper.
+    gravity_compensation_enabled: bool = False
+    gravity_compensation_torque_limit: float = 1.0
 
 
 @TeleoperatorConfig.register_subclass("hyopenarm_leader")
