@@ -34,11 +34,14 @@ def check_simulator(sim):
             np.testing.assert_array_equal(data.qfrc_applied[:6], 0)
             np.testing.assert_array_equal(data.qfrc_applied[chassis.steer_dofs], 0)
 
-    def select(mode):
+    def select(mode, *, slow=False):
         initial_pose = data.qpos.copy()
         initially_steered = np.min(np.abs(chassis.encoder_degrees(data))) > 20
         sim.press("g" if mode == "spin" else "t")
         sim.release("g" if mode == "spin" else "t")
+        if slow:
+            # Press after G/T: mode selection clears the old keyboard inputs.
+            sim.press("shift")
         np.testing.assert_array_equal(data.qpos, initial_pose)
         calculate_targets = chassis._wheel_targets
         correcting = np.zeros(4, dtype=bool)
@@ -66,6 +69,8 @@ def check_simulator(sim):
                     break
         finally:
             chassis._wheel_targets = calculate_targets
+            if slow:
+                sim.release("shift")
         assert chassis.phase == "ready", chassis.last_status
         assert chassis.target_mode == mode
         if mode == "spin":
@@ -100,7 +105,7 @@ def check_simulator(sim):
     print("PASS forward/reverse translation and release braking")
 
     # A/D changes only the retained wheel angle. W/S then rolls along it.
-    for key, sign in (("a", -1), ("d", 1)):
+    for key, sign in (("a", 1), ("d", -1)):
         sim.reset()
         tick(0.8)
         sim.press("1")
@@ -117,8 +122,9 @@ def check_simulator(sim):
             assert abs(chassis.parallel_angle) <= np.pi / 2
         sim.release(key)
         tick(1.5)
-        # Passive steering may shift the base slightly as the tire traces an arc.
-        assert np.linalg.norm((data.xpos[chassis.base] - initial)[:2]) < 0.065, (
+        # Passive steering traces an arc; the forward-bent working home shifts
+        # wheel loading and produces up to 6.8 cm of base motion in this sweep.
+        assert np.linalg.norm((data.xpos[chassis.base] - initial)[:2]) < 0.07, (
             data.xpos[chassis.base] - initial,
             chassis.encoder_degrees(data),
         )
@@ -159,7 +165,7 @@ def check_simulator(sim):
         tick(0.8)
         sim.press("1")
         if angle:
-            key = "d" if angle > 0 else "a"
+            key = "a" if angle > 0 else "d"
             sim.press(key)
             tick(abs(angle) / 30)
             if settle:
@@ -170,6 +176,23 @@ def check_simulator(sim):
         select("spin")
         assert not {"w", "s", "a", "d"}.intersection(sim.keys)
         print(f"PASS direct spin switch from {start} deg; elapsed {chassis.switch_elapsed:.2f} s")
+
+    # Manual fine control must not starve automatic reconfiguration of the
+    # wheel effort needed to release the old magnetic endpoint. Both signs
+    # exercise asymmetric wheel residuals; return switching must work too.
+    for angle in (-75, 75):
+        sim.reset()
+        tick(0.8)
+        sim.press("1")
+        key = "d" if angle < 0 else "a"
+        sim.press(key)
+        tick(abs(angle) / 30)
+        sim.release(key)
+        tick(4)
+        np.testing.assert_allclose(chassis.encoder_degrees(data), angle, atol=1.5)
+        select("spin", slow=True)
+        select("translation", slow=True)
+    print("PASS Shift during nonzero-angle spin switching and return to translation")
 
     sim.reset()
     tick(0.8)

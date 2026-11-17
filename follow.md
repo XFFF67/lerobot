@@ -26,6 +26,11 @@ lerobot-setup-can --mode=test --interfaces=can2,can3 --use_fd=true
 
 #电机上力
 python -m lerobot.scripts.openarm_follower_hold_zero --keep-torque-on-exit
+
+双臂第 4 关节缓慢抬到 90° 的独立「准备模式」见
+[准备模式说明](examples/mobile_openarm/README_PREPARE_zh.md)。
+准备模式与上面的零位保持程序分别运行，不要同时占用从臂 CAN。
+
 # 主臂标定
 <!-- lerobot-calibrate --config_path ~/lerobot/openarm_partial_leader.yaml
 

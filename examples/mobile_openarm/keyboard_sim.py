@@ -25,6 +25,10 @@ MODES = {"1": "chassis", "2": "torso", "3": "left", "4": "right"}
 # Y=5 mm, with its axis along hand Z. Choose the point on that axis at hand Z=0.
 # This is not a measured motor-shaft origin; override it with calibrated CAD data.
 GRIPPER_MOTOR_OFFSET_M = (0.000001, 0.005, 0.0)
+# OpenArm finger_1.obj tip reaches hand Z=95.500892 mm. Mirrored fingers
+# slide symmetrically about hand Y=6 mm; X follows their mesh centreline.
+# This is the midpoint between the model fingertips, not HEI's tool offset.
+GRIPPER_FINGERTIP_OFFSET_M = (0.000001, 0.006, 0.095501)
 
 
 @dataclass
@@ -91,7 +95,7 @@ class KeyboardSimulator:
             if np.any(self.model.jnt_type[fingers] != mujoco.mjtJoint.mjJNT_SLIDE):
                 raise ValueError(f"{side} fingers must be slide joints")
             tcp = self.id("body", f"openarm_{side}_hand_tcp")
-            if args.tcp_reference == "gripper-motor":
+            if args.tcp_reference != "model":
                 hand = self.id("body", f"openarm_{side}_hand")
                 # Reposition only the existing massless, fixed TCP leaf in memory.
                 # FK, IK Jacobians, and the viewer then share the same reference.
@@ -103,7 +107,11 @@ class KeyboardSimulator:
                     or np.any(self.model.body_parentid == tcp)
                 ):
                     raise ValueError(f"{side} hand_tcp must be an empty fixed child of hand")
-                self.model.body_pos[tcp] = args.gripper_motor_offset_m
+                self.model.body_pos[tcp] = (
+                    GRIPPER_FINGERTIP_OFFSET_M
+                    if args.tcp_reference == "fingertip"
+                    else args.gripper_motor_offset_m
+                )
                 self.model.body_quat[tcp] = [1, 0, 0, 0]
             self.arms[side] = Arm(
                 joints,
@@ -149,6 +157,10 @@ class KeyboardSimulator:
             if args.tcp_reference == "gripper-motor"
             else "original model hand_tcp"
         )
+        if args.tcp_reference == "fingertip":
+            self.tcp_description = (
+                f"fingertip center (mesh estimate), hand offset {GRIPPER_FINGERTIP_OFFSET_M} m"
+            )
         print(f"[Keyboard] TCP: {self.tcp_description}", flush=True)
         print(
             f"[Keyboard] Scene: {'HEI-style table and objects' if self.scene_enabled else 'robot only'}",
@@ -177,6 +189,9 @@ class KeyboardSimulator:
             mujoco.mj_resetData(self.model, self.data)
         self.keys.clear()
         for arm in self.arms.values():
+            # Simulation working home: bend both elbows forward by 90 degrees.
+            # Keep the imported model's mechanical zero/keyframe unchanged.
+            self.data.qpos[arm.qpos[3]] = np.pi / 2
             arm.resetting = False
         self.mode = "left"
         self.joint_mode = False
@@ -278,7 +293,7 @@ class KeyboardSimulator:
             self.data,
             dt,
             linear=self.axis(self.keys, "s", "w") if selected else 0.0,
-            steering=self.axis(self.keys, "d", "a") if selected else 0.0,
+            steering=self.axis(self.keys, "a", "d") if selected else 0.0,
             yaw=self.axis(self.keys, "a", "d") if selected else 0.0,
             scale=self.args.fine_scale if "shift" in self.keys else 1.0,
             braking=braking,
@@ -533,9 +548,9 @@ def parse_args(argv=None, *, configure=None):
     )
     parser.add_argument(
         "--tcp-reference",
-        choices=("gripper-motor", "model"),
+        choices=("gripper-motor", "fingertip", "model"),
         default="gripper-motor",
-        help="Control the estimated gripper drive axis or the original model hand_tcp.",
+        help="Control the gripper drive axis, fingertip midpoint, or original model hand_tcp.",
     )
     parser.add_argument(
         "--gripper-motor-offset-m",

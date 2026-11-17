@@ -35,9 +35,15 @@ async def check():
                 https_port = server.sockets[0].getsockname()[1]
                 for path, expected in (
                     ("/", b"Mobile OpenArm VR"),
+                    ("/real", b'id="realHelp"'),
                     ("/vr.js", b"requestSession"),
+                    ("/controller_models.js", b"decodeControllerModel"),
+                    ("/models/touch-v3-left.glb", b"glTF"),
+                    ("/models/touch-plus-right.glb", b"glTF"),
+                    ("/models/touch-pro-left.glb", b"glTF"),
                     ("/api/status", b'"packets": 0'),
                     ("/../vr_server.py", b"404"),
+                    ("/models/../vr_server.py", b"404"),
                 ):
                     reader, writer = await asyncio.open_connection("127.0.0.1", https_port, ssl=client_tls)
                     writer.write(
@@ -47,6 +53,11 @@ async def check():
                     response = await reader.read()
                     assert expected in response
                     assert response.count(b"Content-Type:") == 1
+                    assert response.count(b"Content-Length:") == 1
+                    if path.endswith(".glb"):
+                        headers, body = response.split(b"\r\n\r\n", 1)
+                        assert b"model/gltf-binary" in headers
+                        assert body == (bridge.web_dir / path.lstrip("/")).read_bytes()
                     writer.close()
                     await writer.wait_closed()
                 print("PASS HTTPS: trusted test certificate, HTML/JS serving, no directory traversal")

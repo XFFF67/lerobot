@@ -229,7 +229,9 @@ class ChassisPhysics:
                 self.parallel_angle = float(np.clip(angle, *self.parallel_limits))
         self.translation_active = active
         # W/S changes only rolling speed, never the retained steering target.
-        direction = self.parallel_angle + self.wheel_heading_offset
+        # Roll along the measured wheel heading while the retained target turns.
+        # Waiting for a small target error blocks travel throughout a swivel.
+        direction = float(np.mean(angles)) + self.wheel_heading_offset
         velocity = (
             linear * self.config.linear_speed * scale * np.array([np.cos(direction), np.sin(direction), 0.0])
         )
@@ -255,8 +257,6 @@ class ChassisPhysics:
             self.parallel_integral[:] = 0
             # Hold the selected wheel angle after releasing the keys.
             rates = np.clip(8 * error, -1, 1)
-        if not active or np.max(np.abs(error)) > np.deg2rad(3):
-            velocity[:] = 0
         yaw_targets = self._rolling_targets(data, np.zeros(3), omega)
         # Heading correction must not counteract the common swivel command.
         # Remove its component along the wheel-speed vector that steers all
@@ -287,6 +287,12 @@ class ChassisPhysics:
             else self.slide_positions(data)
         )
         if self.phase in ("straighten", "switch", "capture", "align"):
+            # Reconfiguration has its own wheel controller. Scaling its speed
+            # commands also reduces the P velocity servo's breakaway torque:
+            # the passive linkage can stay on the old magnetic endpoint even
+            # while individual wheels turn. Fine control applies only to manual
+            # driving/steering, never to this automatic endpoint transition.
+            scale = 1.0
             self.switch_elapsed += dt
             self.phase_elapsed += dt
             if self.switch_elapsed > 15:
@@ -311,7 +317,10 @@ class ChassisPhysics:
                 if np.max(gap) < 0.012 and self.phase_elapsed > 0.5:
                     self.phase, self.phase_elapsed = "capture", 0.0
                 else:
-                    return np.clip(-8 * error, -2, 2) * scale, 2.0
+                    # Bent arms shift wheel loading. Track the requested wheel
+                    # speeds firmly enough to release the magnetic endpoint;
+                    # advance() still enforces the same motor torque ceiling.
+                    return np.clip(-8 * error, -2, 2) * scale, 4.0
             if self.phase == "capture":
                 # Let the magnets move the linkage's common coordinates while
                 # opposite wheel torques keep each linked pair aligned. Strong
@@ -339,7 +348,7 @@ class ChassisPhysics:
                     self.phase = "ready"
                     self.parallel_angle = 0.0
                     self.last_status = f"{self.target_mode}: magnetic endpoint reached"
-                return velocity, 2.0
+                return velocity, 4.0
         if self.phase != "ready":
             return np.zeros(4), 2.0
         # Only accept driving while the sliders are seated. A slip/detachment

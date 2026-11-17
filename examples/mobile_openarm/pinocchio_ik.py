@@ -94,6 +94,14 @@ class PinocchioCasadiIK:
         target_position = ca.SX.sym("target_position", 3)
         target_rotation = ca.SX.sym("target_rotation", 3, 3)
         current_q = ca.SX.sym("current_q", self.model.nq)
+        motion_weights = ca.SX.sym("motion_weights", self.model.nq)
+        inward_sign = ca.SX.sym("inward_sign")
+        inward_weight = ca.SX.sym("inward_weight")
+        # Equal weights retain the simulator behavior. Real VR can discourage
+        # selected joints without narrowing their position or velocity bounds.
+        self.motion_weights = np.ones(self.model.nq)
+        self.inward_motion_sign = 0.0
+        self.inward_motion_weight = 1.0
         cpin.framesForwardKinematics(symbolic_model, symbolic_data, q)
         pose = symbolic_data.oMf[self.frame]
         error = ca.vertcat(
@@ -102,10 +110,22 @@ class PinocchioCasadiIK:
             # log3's symbolic branches can produce NaN derivatives at zero.
             (0.2 / np.sqrt(2)) * ca.vec(pose.rotation - target_rotation),
         )
-        params = ca.vertcat(target_position, ca.vec(target_rotation), current_q)
+        params = ca.vertcat(
+            target_position,
+            ca.vec(target_rotation),
+            current_q,
+            motion_weights,
+            inward_sign,
+            inward_weight,
+        )
         self.error_function = ca.Function("tcp_error", [q, params], [error])
         # Scaling keeps small keyboard increments above IPOPT's stopping tolerance.
-        objective = 1e4 * (ca.sumsqr(error) + smooth_weight * ca.sumsqr(q - current_q))
+        delta = q - current_q
+        inward_delta = ca.fmax(inward_sign * delta[1], 0)
+        inward_extra = ca.fmax(inward_weight - motion_weights[1], 0) * inward_delta**2
+        objective = 1e4 * (
+            ca.sumsqr(error) + smooth_weight * (ca.dot(motion_weights, delta**2) + inward_extra)
+        )
         self.solver = ca.nlpsol(
             "arm_ik",
             "ipopt",
@@ -135,7 +155,22 @@ class PinocchioCasadiIK:
     def solve(self, mj_data, position, orientation, max_step):
         current = mj_data.qpos[self.qpos].copy()
         target = body_pose(mj_data, self.root_body).inverse() * pin.SE3(orientation, position)
-        params = np.concatenate((target.translation, target.rotation.ravel(order="F"), current))
+        weights = np.asarray(self.motion_weights, dtype=float)
+        if weights.shape != current.shape or not np.all(np.isfinite(weights)) or np.any(weights <= 0):
+            raise ValueError("IK motion weights must be finite, positive and match the joint count")
+        inward_sign = float(self.inward_motion_sign)
+        inward_weight = float(self.inward_motion_weight)
+        if inward_sign not in (-1.0, 0.0, 1.0) or not np.isfinite(inward_weight) or inward_weight <= 0:
+            raise ValueError("IK inward motion sign/weight is invalid")
+        params = np.concatenate(
+            (
+                target.translation,
+                target.rotation.ravel(order="F"),
+                current,
+                weights,
+                [inward_sign, inward_weight],
+            )
+        )
         initial_error = float(np.linalg.norm(self.error_function(current, params)))
         lower = np.maximum(self.lower, current - max_step)
         upper = np.minimum(self.upper, current + max_step)

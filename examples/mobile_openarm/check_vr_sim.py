@@ -69,6 +69,31 @@ def target_pose(sim, side):
 
 def check_simulator(sim):
     check_protocol()
+    if sim.args.tcp_reference == "fingertip":
+        # Independently locate the two visible tips, including mesh transforms.
+        # The midpoint must remain the TCP across the gripper opening range.
+        scratch = mujoco.MjData(sim.model)
+        for side, arm in sim.arms.items():
+            for opening in (0.0, 0.044):
+                scratch.qpos[:] = sim.data.qpos
+                scratch.qpos[arm.fingers] = opening
+                mujoco.mj_forward(sim.model, scratch)
+                hand = sim.model.body(f"openarm_{side}_hand").id
+                rotation = scratch.xmat[hand].reshape(3, 3)
+                tips = []
+                for finger in ("left", "right"):
+                    geom = sim.model.geom(f"openarm_{side}_{finger}_finger_visual_1").id
+                    mesh = sim.model.geom_dataid[geom]
+                    start = sim.model.mesh_vertadr[mesh]
+                    vertices = sim.model.mesh_vert[start : start + sim.model.mesh_vertnum[mesh]]
+                    world = vertices @ scratch.geom_xmat[geom].reshape(3, 3).T + scratch.geom_xpos[geom]
+                    local = (world - scratch.xpos[hand]) @ rotation
+                    tip = local[local[:, 2] > local[:, 2].max() - 1e-6]
+                    tips.append((tip.min(axis=0) + tip.max(axis=0)) / 2)
+                actual = rotation.T @ (scratch.xpos[arm.tcp] - scratch.xpos[hand])
+                np.testing.assert_allclose(actual, np.mean(tips, axis=0), atol=0.0002)
+                arm.ik.validate_fk(scratch)
+        print("PASS TCP at visible fingertip midpoint for both arms, gripper open and closed")
     dt = 0.02
     packet = {}
 
@@ -99,6 +124,89 @@ def check_simulator(sim):
     assert abs(np.linalg.det(sim.mapping) - 1) < 1e-12
     print("PASS coordinates: forward=-X, left=-Y, up=+Z; proper rotation")
 
+    # A 25 cm/s hand motion used to leave a 5 cm backlog at keyboard limits.
+    # Check both arms, a reversal, settling, and release while still catching up.
+    start()
+    tick(40)
+    for side in sim.arms:
+        packet[f"{side}Controller"]["gripActive"] = True
+    tick()
+    initial = {side: target_pose(sim, side)[0] for side in sim.arms}
+    up = {
+        side: sim.data.xmat[arm.ik.root_body].reshape(3, 3).T @ np.array([0.0, 0.0, 1.0])
+        for side, arm in sim.arms.items()
+    }
+    for end in (0.1, 0.0):
+        for i in range(20):
+            offset = (i + 1) * 0.005 if end else 0.1 - (i + 1) * 0.005
+            for side in sim.arms:
+                packet[f"{side}Controller"]["position"]["y"] = 1 + offset
+            tick()
+        for side in sim.arms:
+            error = np.linalg.norm(target_pose(sim, side)[0] - initial[side] - up[side] * end)
+            assert error < 0.015, (side, "moving target lag", error)
+        tick(10)
+        for side in sim.arms:
+            error = np.linalg.norm(target_pose(sim, side)[0] - initial[side] - up[side] * end)
+            assert error < 0.003, (side, "settled error", error)
+    for side in sim.arms:
+        packet[f"{side}Controller"]["position"]["y"] += 0.05
+    tick()
+    for side in sim.arms:
+        packet[f"{side}Controller"]["gripActive"] = False
+    held = target_qpos(sim)
+    tick(10)
+    for arm in sim.arms.values():
+        np.testing.assert_allclose(target_qpos(sim)[arm.qpos], held[arm.qpos], atol=1e-12)
+    print("PASS VR fast following, reversal, settle and cancellation of filtered targets on release")
+
+    # Extend beyond reach, then pull back just 4 cm without releasing the grip.
+    # Previously the stored unreachable target kept both elbows at zero until
+    # the hand had retraced the entire overshoot (roughly 30 cm in this case).
+    start()
+    tick(40)
+    for side in sim.arms:
+        packet[f"{side}Controller"]["gripActive"] = True
+    tick()
+    directions, xr_directions = {}, {}
+    for side, arm in sim.arms.items():
+        position = target_pose(sim, side)[0]
+        directions[side] = position / np.linalg.norm(position)
+        root_rotation = sim.data.xmat[arm.ik.root_body].reshape(3, 3)
+        mapping = root_rotation.T @ sim.data.xmat[sim.base].reshape(3, 3) @ sim.mapping
+        xr_directions[side] = mapping.T @ directions[side]
+    for i in range(80):
+        for side in sim.arms:
+            position = np.array([0.0, 1.0, 0.0]) + 0.45 * (i + 1) / 80 * xr_directions[side]
+            packet[f"{side}Controller"]["position"] = dict(zip("xyz", position, strict=True))
+        tick()
+    tick(30)
+    at_limit = {side: target_pose(sim, side)[0] for side in sim.arms}
+    for arm in sim.arms.values():
+        assert target_qpos(sim)[arm.qpos[3]] < np.deg2rad(10)
+    for i in range(20):
+        for side in sim.arms:
+            position = np.array([0.0, 1.0, 0.0]) + (0.45 - 0.04 * (i + 1) / 20) * xr_directions[side]
+            packet[f"{side}Controller"]["position"] = dict(zip("xyz", position, strict=True))
+        tick()
+    tick(10)
+    for side, arm in sim.arms.items():
+        displacement = target_pose(sim, side)[0] - at_limit[side]
+        assert displacement @ directions[side] < -0.025, (side, displacement)
+        assert target_qpos(sim)[arm.qpos[3]] > np.deg2rad(20), side
+    # Re-gripping after this boundary adjustment must still be jump-free.
+    for side in sim.arms:
+        packet[f"{side}Controller"]["gripActive"] = False
+    tick()
+    held = target_qpos(sim)
+    for side in sim.arms:
+        packet[f"{side}Controller"]["position"]["x"] += 0.1
+        packet[f"{side}Controller"]["gripActive"] = True
+    tick()
+    for arm in sim.arms.values():
+        np.testing.assert_allclose(target_qpos(sim)[arm.qpos], held[arm.qpos], atol=1e-6)
+    print("PASS both straight elbows bend on a 4 cm return after unreachable extension; re-grip has no jump")
+
     start()
     for side in sim.arms:
         packet[f"{side}Controller"]["gripActive"] = True
@@ -126,17 +234,28 @@ def check_simulator(sim):
         np.testing.assert_allclose(target_qpos(sim)[arm.qpos], held[arm.qpos], atol=1e-6)
     print("PASS simultaneous dual-arm motion, release hold, clutch without jumps, joint bounds")
 
-    # Quaternion changes must move the TCP orientation, independently of position.
+    # Quaternion changes move orientation independently of position.
     start()
     right = packet["rightController"]
-    right["gripActive"] = True
+    for side in sim.arms:
+        packet[f"{side}Controller"]["gripActive"] = True
     tick()
-    initial_rotation = target_pose(sim, "right")[1]
+    initial_poses = {side: target_pose(sim, side) for side in sim.arms}
     for i in range(40):
         angle = (i + 1) * 0.004
-        right["quaternion"] = {"w": np.cos(angle / 2), "x": 0, "y": np.sin(angle / 2), "z": 0}
+        for side in sim.arms:
+            packet[f"{side}Controller"]["quaternion"] = {
+                "w": np.cos(angle / 2),
+                "x": 0,
+                "y": np.sin(angle / 2),
+                "z": 0,
+            }
         tick()
-    assert np.linalg.norm(target_pose(sim, "right")[1] - initial_rotation) > 0.05
+        for side in sim.arms:
+            assert np.linalg.norm(target_pose(sim, side)[0] - initial_poses[side][0]) < 0.002
+    for side in sim.arms:
+        assert np.linalg.norm(target_pose(sim, side)[1] - initial_poses[side][1]) > 0.05
+    print("PASS in-place controller rotation keeps both TCP centers within 2 mm")
     right["trigger"] = True
     tick(65)
     arm = sim.arms["right"]
@@ -241,8 +360,8 @@ def check_simulator(sim):
         left["thumbstick"]["y"] = 1  # diagonal steering must not lower the lift
         lift_before = target_qpos(sim)[sim.lift.qpos].copy()
         tick(20)
-        assert sim.chassis.parallel_angle < -0.04
-        assert sim.chassis_command[0] == 0 and sim.chassis_command[1] < 0
+        assert sim.chassis.parallel_angle > 0.04
+        assert sim.chassis_command[0] == 0 and sim.chassis_command[1] > 0
         np.testing.assert_allclose(target_qpos(sim)[sim.lift.qpos], lift_before)
         left["gripActive"] = True  # same stick now selects lift, never steering
         angle = sim.chassis.parallel_angle
@@ -253,7 +372,7 @@ def check_simulator(sim):
         left["gripActive"] = False
         left["thumbstick"]["y"] = 0
         tick()
-        assert sim.chassis_command[1] < 0
+        assert sim.chassis_command[1] > 0
         # Losing the steering hand cannot replay an old steering input.
         packet["leftController"] = None
         tick()
@@ -294,5 +413,36 @@ def check_simulator(sim):
         assert sim.chassis.phase == "ready", sim.chassis.last_status
         assert not sim.chassis.faulted
         print("PASS physical chassis: forward, steer, spin mode, release cancels, resume, yaw, return")
+
+        # Exercise both sticks together through real packets and wheel contact.
+        # Turning must not suppress travel while the wheels lag their target.
+        for travel in (-1, 1):
+            for stick_x in (-1, 1):
+                start()
+                tick(40)
+                right = packet["rightController"]
+                left = packet["leftController"]
+                right["gripActive"] = True
+                right["thumbstick"]["y"] = travel
+                left["thumbstick"]["x"] = stick_x
+                base = sim.data.xpos[sim.base].copy()
+                rotation = sim.data.xmat[sim.base].reshape(3, 3).copy()
+                for _ in range(100):
+                    tick()
+                    assert sim.chassis.phase == "ready", sim.chassis.last_status
+                    assert not sim.chassis.faulted
+                    assert np.max(np.abs(sim.chassis.slide_positions(sim.data))) < 0.001
+                    assert (
+                        np.max(np.abs(sim.data.ctrl[sim.chassis.motors])) <= sim.chassis.config.motor_torque
+                    )
+                displacement = rotation.T @ (sim.data.xpos[sim.base] - base)
+                assert travel * displacement[0] > 0.08, displacement
+                assert -travel * stick_x * displacement[1] > 0.025, displacement
+                assert np.all(-stick_x * sim.chassis.encoder_degrees(sim.data) > 30)
+                right["gripActive"] = False
+                tick(60)
+                assert sim.chassis_braking
+                assert np.linalg.norm(sim.data.qvel[:2]) < 0.01
+        print("PASS simultaneous forward/reverse and left/right steering; grip release brakes")
     sim.reset()
     print("PASS all VR simulator checks")

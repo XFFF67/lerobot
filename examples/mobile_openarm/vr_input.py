@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import time
 from dataclasses import dataclass, field
 
@@ -120,6 +122,47 @@ class ZMQReceiver(VRInput):
     def close(self):
         self.socket.close(0)
         self.context.term()
+
+
+def ensure_fifo(path: str) -> None:
+    try:
+        os.mkfifo(path, 0o600)
+    except FileExistsError:
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISFIFO(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"Refusing unsafe VR FIFO: {path}") from None
+
+
+class FifoReceiver(VRInput):
+    """Latest VR snapshots from a non-blocking local named pipe."""
+
+    def __init__(self, path: str, timeout: float):
+        super().__init__(timeout)
+        ensure_fifo(path)
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.buffer = b""
+
+    def poll(self):
+        while True:
+            try:
+                chunk = os.read(self.fd, 16384)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            self.buffer += chunk
+        lines = self.buffer.split(b"\n")
+        self.buffer = lines.pop()
+        for latest in lines:
+            if not latest:
+                continue
+            try:
+                self.ingest(latest.decode())
+            except UnicodeDecodeError:
+                pass
+
+    def close(self):
+        os.close(self.fd)
 
 
 def deadzone(value: float, threshold: float) -> float:

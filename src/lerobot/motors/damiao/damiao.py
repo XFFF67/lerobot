@@ -17,6 +17,7 @@
 # https://github.com/cmjang/DM_Control_Python
 
 import logging
+import math
 import time
 from contextlib import contextmanager
 from copy import deepcopy
@@ -146,6 +147,7 @@ class DamiaoMotorsBus(MotorsBusBase):
             }
             for name in self.motors
         }
+        self._last_state_times: dict[str, float] = {}
 
         # Dynamic gains storage
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
@@ -165,6 +167,7 @@ class DamiaoMotorsBus(MotorsBusBase):
             handshake: If True, ping all motors to verify they're present
         """
 
+        self._last_state_times.clear()
         try:
             # Auto-detect interface type based on port name
             if self.can_interface == "auto":
@@ -582,6 +585,7 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
             }
+            self._last_state_times[motor] = time.monotonic()
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
 
@@ -659,16 +663,33 @@ class DamiaoMotorsBus(MotorsBusBase):
         motors: str | list[str] | None = None,
         *,
         num_retry: int = 0,
+        max_age_s: float | None = None,
     ) -> dict[str, MotorState]:
         """
         Read ALL motor states (position, velocity, torque) from multiple motors in ONE refresh cycle.
+
+        When max_age_s is set, reject motors that have never replied or whose
+        last successfully decoded reply is older than that many seconds. Without
+        it, retain the usual cached-state behavior for existing callers.
 
         Returns:
             Dictionary mapping motor names to state dicts with keys: 'position', 'velocity', 'torque'
             Example: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5}, ...}
         """
+        if max_age_s is not None and (not math.isfinite(max_age_s) or max_age_s <= 0):
+            raise ValueError("max_age_s must be finite and positive")
         target_motors = self._get_motors_list(motors)
         self._batch_refresh(target_motors)
+
+        if max_age_s is not None:
+            now = time.monotonic()
+            stale = [
+                motor
+                for motor in target_motors
+                if motor not in self._last_state_times or now - self._last_state_times[motor] > max_age_s
+            ]
+            if stale:
+                raise ConnectionError(f"Missing or stale motor feedback on {self.port}: {', '.join(stale)}")
 
         result = {}
         for motor in target_motors:

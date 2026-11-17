@@ -24,7 +24,8 @@ def check_scene(sim):
             assert sim.model.geom_contype[index] == 0 and sim.model.geom_conaffinity[index] == 0
     assert sim.model.nlight >= 2
 
-    # Adding a visual scene must preserve the robot's joint order and home pose.
+    # Scene construction preserves model coordinates and the mechanical home;
+    # the simulator selects a separate working pose with both elbows at 90 deg.
     original = mujoco.MjModel.from_xml_path(str(sim.args.mjcf.expanduser().resolve()))
     original_data = mujoco.MjData(original)
     key = mujoco.mj_name2id(original, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -34,12 +35,16 @@ def check_scene(sim):
     assert (sim.model.nq, sim.model.nv, sim.model.nu) == (original.nq, original.nv, original.nu)
     np.testing.assert_array_equal(sim.model.jnt_qposadr, original.jnt_qposadr)
     np.testing.assert_array_equal(sim.model.actuator_trnid, original.actuator_trnid)
-    np.testing.assert_allclose(sim.data.qpos, original_data.qpos, atol=1e-12)
+    np.testing.assert_array_equal(sim.model.key_qpos, original.key_qpos)
+    expected = original_data.qpos.copy()
+    for arm in sim.arms.values():
+        expected[arm.qpos[3]] = np.pi / 2
+    np.testing.assert_allclose(sim.data.qpos, expected, atol=1e-12)
     for joint in range(original.njnt):
         assert mujoco.mj_id2name(sim.model, mujoco.mjtObj.mjOBJ_JOINT, joint) == mujoco.mj_id2name(
             original, mujoco.mjtObj.mjOBJ_JOINT, joint
         )
-    print("PASS HEI-style scene: floor, objects, lights, visual-only geometry, unchanged robot joints/home")
+    print("PASS HEI-style scene: unchanged model joints/keyframes, 90-degree elbow working home")
 
 
 def check_pinocchio_ik(sim):
@@ -229,7 +234,7 @@ def check_simulator(sim):
         sim.reset()
         arm = sim.arms[side]
         other = sim.arms["right" if side == "left" else "left"]
-        # Move away from the fully straight home configuration for the 6D IK checks.
+        # Exercise 6D IK from an asymmetric pose distinct from the working home.
         sim.data.qpos[arm.qpos] = [0.1, -0.4 if side == "left" else 0.4, 0.2, 0.8, 0.1, 0.1, 0.1]
         sim.forward()
         bent = sim.data.qpos.copy()

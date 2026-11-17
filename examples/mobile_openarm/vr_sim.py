@@ -19,6 +19,8 @@ class Anchor:
     tcp_rotation: np.ndarray
     previous_position: np.ndarray
     previous_rotation: np.ndarray
+    filtered_position: np.ndarray
+    filtered_rotation: np.ndarray
 
 
 def controller_rotation(controller: Controller) -> np.ndarray:
@@ -29,7 +31,15 @@ def controller_rotation(controller: Controller) -> np.ndarray:
 
 def add_vr_args(parser):
     parser.description = __doc__
-    parser.set_defaults(chassis_physics=True)
+    # VR hand tracking needs its own limits, rather than keyboard jog speeds.
+    # These are simulation targets, not motor specifications for the real arm.
+    parser.set_defaults(
+        chassis_physics=True,
+        tcp_reference="fingertip",
+        arm_linear_speed_m_s=0.5,
+        arm_angular_speed_deg_s=180.0,
+        joint_speed_rad_s=3.0,
+    )
     parser.add_argument("--no-chassis-physics", dest="chassis_physics", action="store_false")
     parser.add_argument("--vr-endpoint", default="tcp://127.0.0.1:5567")
     parser.add_argument("--vr-topic", default="vr_data", help="Empty string accepts raw JSON too.")
@@ -69,6 +79,7 @@ class VRSimulator(KeyboardSimulator):
         self.chassis_command = (0.0, 0.0, 0.0)
         self.chassis_braking = True
         self.last_tracking = None
+        self.target_filter_scale = 1.0
         # WebXR: +X right, +Y up, -Z forward. Map to robot forward/left/up,
         # then rotate to this model's forward (-X); determinant remains +1.
         xr_to_forward = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float)
@@ -132,6 +143,8 @@ class VRSimulator(KeyboardSimulator):
                 root_rotation.T @ self.data.xmat[arm.tcp].reshape(3, 3),
                 controller.position.copy(),
                 rotation.copy(),
+                root_rotation.T @ (self.data.xpos[arm.tcp] - root_position),
+                root_rotation.T @ self.data.xmat[arm.tcp].reshape(3, 3),
             )
         anchor = self.anchors[side]
         jump = np.linalg.norm(controller.position - anchor.previous_position)
@@ -146,9 +159,21 @@ class VRSimulator(KeyboardSimulator):
         # Convert base-frame motions to the current shoulder axes.
         mapping = root_rotation.T @ self.data.xmat[self.base].reshape(3, 3) @ self.mapping
         offset = mapping @ (controller.position - anchor.controller_position) * self.args.vr_position_scale
-        position = root_position + root_rotation @ (anchor.tcp_position + offset)
+        target_position = anchor.tcp_position + offset
         delta_rotation = mapping @ rotation @ anchor.controller_rotation.T @ mapping.T
-        orientation = root_rotation @ delta_rotation @ anchor.tcp_rotation
+        target_rotation = delta_rotation @ anchor.tcp_rotation
+        # HEI's adaptive target filter: responsive for large motions, quieter
+        # near rest. Filter in shoulder coordinates so chassis/lift motion does
+        # not create an artificial lag relative to the arm's own base.
+        error = target_position - anchor.filtered_position
+        rot_error = rotation_vector(target_rotation @ anchor.filtered_rotation.T)
+        activity = min(1.0, max(np.linalg.norm(error) / 0.015, np.linalg.norm(rot_error) / np.deg2rad(8)))
+        tau = (0.055 + activity * (0.018 - 0.055)) * self.target_filter_scale
+        alpha = -np.expm1(-dt / tau)
+        anchor.filtered_position += alpha * error
+        anchor.filtered_rotation = rotation_matrix(alpha * rot_error) @ anchor.filtered_rotation
+        position = root_position + root_rotation @ anchor.filtered_position
+        orientation = root_rotation @ anchor.filtered_rotation
         # Bound Cartesian and joint steps even for large but continuous moves.
         error = position - self.data.xpos[arm.tcp]
         limit = self.args.arm_linear_speed_m_s * dt
@@ -160,14 +185,33 @@ class VRSimulator(KeyboardSimulator):
             rotation_matrix(rot_error * min(1, rot_limit / max(np.linalg.norm(rot_error), 1e-12)))
             @ current_rotation
         )
-        result = arm.ik.solve(self.data, position, orientation, self.args.joint_speed_rad_s * dt)
+        max_joint_step = self.args.joint_speed_rad_s * dt
+        current_q = self.data.qpos[arm.qpos].copy()
+        result = arm.ik.solve(self.data, position, orientation, max_joint_step)
         if result.accepted:
             self.data.qpos[arm.qpos] = result.q
+            # A straight arm cannot follow further extension. Do not accumulate
+            # an unreachable target that the user must "unwind" before bending
+            # the elbow again. Only remove the blocked Cartesian component;
+            # preserve tangential travel and the orientation target. Ordinary
+            # joint-rate saturation must retain its target and catch up.
+            if result.q[3] < np.deg2rad(10) and np.max(np.abs(result.q - current_q)) < 0.9 * max_joint_step:
+                achieved = arm.ik.forward_world(result.q, self.data).translation
+                blocked = root_rotation.T @ (position - achieved)
+                blocked_length = np.linalg.norm(blocked)
+                if np.linalg.norm(error) > 0.0005 and blocked_length > 0.0005:
+                    direction = blocked / blocked_length
+                    achieved_local = root_rotation.T @ (achieved - root_position)
+                    excess = max(0.0, float((target_position - achieved_local) @ direction))
+                    anchor.tcp_position -= excess * direction
+                    filtered_excess = max(0.0, float((anchor.filtered_position - achieved_local) @ direction))
+                    anchor.filtered_position -= filtered_excess * direction
         limits = self.model.jnt_range[arm.finger_joints]
         target = limits[:, 1] if controller.trigger else limits[:, 0]
         step = self.args.gripper_speed_m_s * dt
         self.data.qpos[arm.fingers] += np.clip(target - self.data.qpos[arm.fingers], -step, step)
         self.forward()
+        return result
 
     def update_chassis(self, controllers):
         right, left = controllers["right"], controllers["left"]
@@ -179,8 +223,9 @@ class VRSimulator(KeyboardSimulator):
         linear = deadzone(right.stick[1], self.args.vr_deadzone)
         # Put wheel heading and travel on separate hands. Left grip selects
         # lift control, so diagonal lift inputs cannot also steer the wheels.
+        # WebXR stick-left is negative; keyboard A uses positive wheel angles.
         steering = (
-            deadzone(left.stick[0], self.args.vr_deadzone)
+            -deadzone(left.stick[0], self.args.vr_deadzone)
             if left.valid and not left.grip and self.armed["left"]
             else 0.0
         )
