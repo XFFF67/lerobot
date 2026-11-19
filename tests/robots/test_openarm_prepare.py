@@ -340,6 +340,26 @@ def test_right_elbow_negative_offset_remains_blocked_and_all_errors_reported():
     assert "left_joint_4.pos=-2.0" in str(exc.value)
 
 
+def test_startup_homing_accepts_joint_excursion_but_only_allows_inward_commands():
+    backend = position_validation_backend()
+    positions = arm_positions()
+    positions["left_joint_4.pos"] = -1.1474892898591635
+    initial = backend.validate_positions(
+        positions,
+        measurement=True,
+        allow_joint_excursions=True,
+    )
+    assert initial["left_joint_4.pos"] == positions["left_joint_4.pos"]
+    home = backend.validate_positions(prepare.home_goal(initial))
+    assert home["left_joint_4.pos"] == 0.0
+    assert backend.validate_recovery_positions(initial, initial) == initial
+    assert backend.validate_recovery_positions(home, initial) == home
+    outward = dict(initial)
+    outward["left_joint_4.pos"] -= 0.01
+    with pytest.raises(RuntimeError, match="moves outward"):
+        backend.validate_recovery_positions(outward, initial)
+
+
 def test_read_only_inspection_does_not_enable_disable_move_or_clip_feedback(capsys):
     backend = fake_backend()
     backend.arms = position_validation_backend().arms

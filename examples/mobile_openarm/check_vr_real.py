@@ -93,8 +93,8 @@ def check_targets():
     np.testing.assert_allclose(list(state["command"].values()), list(initial.values()), atol=1e-7)
     for i in range(50):
         packet["leftController"]["position"]["x"] = 0.0005 * i
-        # Unwired mobile and simulation-home inputs must have no effect.
-        packet["leftController"]["thumbstick"] = {"x": 1, "y": 1, "pressed": True}
+        packet["leftController"]["thumbstick"] = {"x": 0, "y": 0, "pressed": False}
+        # Simulation-home inputs must have no effect on the real motor target.
         packet["leftController"]["xButton"] = True
         packet["rightController"]["bButton"] = True
         tick()
@@ -104,6 +104,19 @@ def check_targets():
         [initial[k] for k in KEYS if k.startswith("right")],
         atol=1e-6,
     )
+    held = dict(state["command"])
+    packet["leftController"]["thumbstick"] = {"x": 0, "y": 1, "pressed": False}
+    for i in range(10):
+        packet["leftController"]["position"]["x"] += 0.002
+        result = tick()
+        assert not result["active"]["left"] and result["reason"]["left"] == "mobile_control"
+    np.testing.assert_allclose(
+        [state["command"][k] for k in KEYS if k.startswith("left")],
+        [held[k] for k in KEYS if k.startswith("left")],
+        atol=1e-6,
+    )
+    packet["leftController"]["thumbstick"] = {"x": 0, "y": 0, "pressed": False}
+    tick()
     arm_indices = np.concatenate([np.r_[a.qpos, a.fingers] for a in targeter.sim.arms.values()])
     other = np.setdiff1d(np.arange(len(mobile_before)), arm_indices)
     np.testing.assert_allclose(targeter.sim.data.qpos[other], mobile_before[other])
@@ -240,8 +253,12 @@ def check_worker():
     mobile_frames = []
 
     class FakeMobile:
-        def write(self, frame):
+        def write_live(self, frame):
             mobile_frames.append(bytes(frame))
+
+        def stop_without_reconfiguring(self):
+            mobile_frames.append(MOBILE_NEUTRAL_FRAME)
+
     class FakeBackend:
         arms = {
             side: SimpleNamespace(config=SimpleNamespace(joint_limits=limits))

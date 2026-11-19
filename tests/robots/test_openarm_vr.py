@@ -241,7 +241,11 @@ def test_mobile_output_validates_worker_frames_and_stops_on_close(monkeypatch):
     with pytest.raises(ValueError, match="Invalid mobile frame"):
         output.write([0x55, 0])
     output.close()
-    assert port.writes == [vr.MOBILE_NEUTRAL_FRAME, bytes(motion), vr.MOBILE_NEUTRAL_FRAME]
+    assert port.writes == [
+        vr.MOBILE_NEUTRAL_FRAME,
+        bytes(motion),
+        vr.MOBILE_NEUTRAL_FRAME,
+    ]
     assert port.reads == 4 and port.reset and port.closed
 
 
@@ -268,8 +272,8 @@ def test_arm_control_loop_writes_mobile_frame_from_same_target_packet(monkeypatc
     monkeypatch.setattr(vr, "latest_packet", incoming)
     monkeypatch.setattr(vr, "send_packet", lambda *_: True)
     vr.control_loop(backend, worker, positions(), vr.MotionLimits(), stop, args, mobile)
-    assert mobile.write.call_count >= 1
-    assert all(call.args[0] == frame for call in mobile.write.call_args_list)
+    assert mobile.write_live.call_count >= 1
+    assert all(call.args[0] == frame for call in mobile.write_live.call_args_list)
 
 
 @pytest.mark.parametrize("scenario", ["grasp", "opening_jam", "arm_jam"])
@@ -496,13 +500,19 @@ def test_single_backend_prepares_then_vr_then_continuous_slow_return(monkeypatch
     vr.run(args, threading.Event(), lambda *_: backend, lambda *_: worker)
     backend.connect.assert_called_once()
     initial = dict(backend.read.return_value[0])
-    initial["left_joint_4.pos"] = max(0.0, elbow_offset)
-    backend.enable.assert_called_once_with(initial)
+    if elbow_offset < 0.0:
+        backend.enable.assert_called_once_with(initial, recovery_from=initial)
+    else:
+        backend.enable.assert_called_once_with(initial)
     home = vr.home_goal(initial)
     assert home["right_joint_1.pos"] == 0.0
     assert home["left_gripper.pos"] == -20.0
     assert motions[0][:3] == (initial, home, 10)
     assert motions[0][3]["phase"] == "HOMING"
+    if elbow_offset < 0.0:
+        assert motions[0][3]["recovery_from"] == initial
+    else:
+        assert "recovery_from" not in motions[0][3]
     assert motions[1][:3] == (home, vr.preparation_goal(home), 20)
     assert teleop.call_args.args[2] == motions[1][1]
     assert motions[2][:3] == (final, home, 30)

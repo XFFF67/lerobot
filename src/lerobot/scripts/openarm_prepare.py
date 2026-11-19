@@ -296,7 +296,7 @@ class DamiaoPreparationBackend:
             raise RuntimeError("Non-finite motor feedback")
         return positions, velocities
 
-    def validate_positions(self, positions, *, measurement=False):
+    def validate_positions(self, positions, *, measurement=False, allow_joint_excursions=False):
         checked = dict(positions)
         errors = []
         reported_feedback_clips = vars(self).setdefault("_reported_feedback_clips", set())
@@ -305,6 +305,14 @@ class DamiaoPreparationBackend:
                 # Permit small measured endpoint offsets, never out-of-range commands.
                 key = f"{side}_{motor}.pos"
                 value = positions[key]
+                if measurement and allow_joint_excursions and motor != "gripper":
+                    if not math.isfinite(value):
+                        errors.append(f"{key}={value} is not finite")
+                    # Startup homing may begin outside the configured operating
+                    # range. Preserve the measured value so enabling torque does
+                    # not introduce a position step; recovery commands are
+                    # checked separately to ensure they never move farther out.
+                    continue
                 tolerance = 0.0
                 if measurement:
                     tolerance = (
@@ -332,8 +340,31 @@ class DamiaoPreparationBackend:
             raise RuntimeError("Position validation failed:\n" + "\n".join(errors))
         return checked
 
-    def send(self, positions):
-        self.validate_positions(positions)
+    def validate_recovery_positions(self, positions, recovery_from):
+        """Allow startup commands only on the path from an excursion back into range."""
+        errors = []
+        for side, arm in self.arms.items():
+            for motor, (low, high) in arm.config.joint_limits.items():
+                key = f"{side}_{motor}.pos"
+                value = positions[key]
+                start = recovery_from[key]
+                if not math.isfinite(value) or not math.isfinite(start):
+                    errors.append(f"{key} has non-finite startup recovery position")
+                elif start < low and not start <= value <= high:
+                    errors.append(f"{key}={value} moves outward from startup position {start}")
+                elif start > high and not low <= value <= start:
+                    errors.append(f"{key}={value} moves outward from startup position {start}")
+                elif low <= start <= high and not low <= value <= high:
+                    errors.append(f"{key}={value} outside configured operating limits [{low}, {high}]")
+        if errors:
+            raise RuntimeError("Startup recovery validation failed:\n" + "\n".join(errors))
+        return dict(positions)
+
+    def send(self, positions, *, recovery_from=None):
+        if recovery_from is None:
+            self.validate_positions(positions)
+        else:
+            self.validate_recovery_positions(positions, recovery_from)
         for side, arm in self.arms.items():
             prefix = f"{side}_"
             action = {
@@ -344,18 +375,18 @@ class DamiaoPreparationBackend:
             )
             arm.send_action(action, custom_kp=kp, custom_kd=kd)
 
-    def enable(self, initial):
+    def enable(self, initial, *, recovery_from=None):
         for side, arm in self.arms.items():
             kp, kd = support_gains(
                 arm.config, self.support_gain_scale, getattr(self, "gripper_gain_scale", 1.0)
             )
             logger.info("%s preparation support gains: Kp=%s Kd=%s", side, kp, kd)
         # Seed current-position commands, then enable and immediately resend them.
-        self.send(initial)
+        self.send(initial, recovery_from=recovery_from)
         self.enabled = True  # Also covers a partially successful enable sequence.
         for arm in self.arms.values():
             arm.bus.enable_torque()
-        self.send(initial)
+        self.send(initial, recovery_from=recovery_from)
 
     def close(self, *, disable_torque):
         for arm in self.arms.values():
@@ -379,6 +410,7 @@ def run_motion(
     phase=None,
     verify_arrival=True,
     tick_callback=None,
+    recovery_from=None,
 ):
     trajectory = PreparationTrajectory(start, goal, limits)
     monitor = PreparationMonitor(trajectory, limits)
@@ -422,7 +454,10 @@ def run_motion(
                 logger.info("%s COMMAND COMPLETE: timed target trajectory finished", phase)
             ready_announced = True
         previous_command = trajectory.sample(elapsed)
-        backend.send(previous_command)
+        if recovery_from is None:
+            backend.send(previous_command)
+        else:
+            backend.send(previous_command, recovery_from=recovery_from)
         if tick_callback is not None:
             tick_callback()
         if ready and not hold:

@@ -123,12 +123,12 @@ class MobileOutput:
     def close(self):
         if self.closed:
             return
-        self.closed = True
         try:
             self.port.reset_output_buffer()
             self.port.write(MOBILE_NEUTRAL_FRAME)
             time.sleep(0.02)
         finally:
+            self.closed = True
             self.port.close()
 
 
@@ -508,7 +508,10 @@ def control_loop(backend, worker, initial_command, limits, stop, args, mobile=No
             )
         backend.send(command)
         if mobile is not None:
-            mobile.write(packet["mobile_frame"] if fresh and packet is not None else MOBILE_NEUTRAL_FRAME)
+            if fresh and packet is not None:
+                mobile.write_live(packet["mobile_frame"])
+            else:
+                mobile.stop_without_reconfiguring()
         moving = tuple(
             bool(packet and packet["active"][side] and 0 <= now - packet["vr_time"][side] <= 0.3)
             for side in SIDES
@@ -568,7 +571,11 @@ def stationary_start(backend, limits, stop, tick_callback=None):
         now = time.monotonic()
         if now - tick > limits.feedback_timeout_s:
             raise RuntimeError("Startup feedback deadline exceeded")
-        checked = backend.validate_positions(positions, measurement=True)
+        checked = backend.validate_positions(
+            positions,
+            measurement=True,
+            allow_joint_excursions=True,
+        )
         if tick_callback is not None:
             tick_callback()
         quiet = all(abs(v) <= limits.arrival_speed_deg_s for v in velocities.values())
@@ -589,6 +596,21 @@ def stationary_start(backend, limits, stop, tick_callback=None):
     return None
 
 
+def startup_recovery_origin(backend, positions):
+    """Return the measured origin only when an arm joint starts outside its range."""
+    arms = getattr(backend, "arms", None)
+    if not isinstance(arms, dict):
+        return None
+    for side, arm in arms.items():
+        for motor, (low, high) in arm.config.joint_limits.items():
+            if motor == "gripper":
+                continue
+            value = positions[f"{side}_{motor}.pos"]
+            if value < low or value > high:
+                return dict(positions)
+    return None
+
+
 def run(args, stop, backend_factory=DamiaoPreparationBackend, worker_factory=IKWorker):
     limits = MotionLimits(duration_s=args.prepare_duration_s)
     worker = worker_factory(args)
@@ -600,31 +622,37 @@ def run(args, stop, backend_factory=DamiaoPreparationBackend, worker_factory=IKW
         worker.wait_ready(stop)
         if args.mobile_port:
             mobile = MobileOutput(args.mobile_port)
-            logger.info(
-                "Mobile C-board preflight passed on %s; neutral command sent",
-                args.mobile_port,
-            )
+            logger.info("Mobile C-board preflight passed on %s; neutral command sent", args.mobile_port)
         backend = backend_factory(args, limits)
         backend.connect()
-        startup_tick = (lambda: mobile.write(MOBILE_NEUTRAL_FRAME)) if mobile is not None else None
+        startup_tick = mobile.write_startup if mobile is not None else None
         initial = stationary_start(backend, limits, stop, startup_tick)
         if initial is None:
             return
         home = backend.validate_positions(home_goal(initial))
         goal = backend.validate_positions(preparation_goal(home))
+        recovery_from = startup_recovery_origin(backend, initial)
         if stop.is_set():
             return
-        backend.enable(initial)
+        if recovery_from is None:
+            backend.enable(initial)
+        else:
+            backend.enable(initial, recovery_from=recovery_from)
+        homing_options = {
+            "hold": False,
+            "phase": "HOMING",
+            "verify_arrival": False,
+            "tick_callback": startup_tick,
+        }
+        if recovery_from is not None:
+            homing_options["recovery_from"] = recovery_from
         last = run_motion(
             backend,
             initial,
             home,
             MotionLimits(duration_s=args.home_duration_s),
             stop,
-            hold=False,
-            phase="HOMING",
-            verify_arrival=False,
-            tick_callback=startup_tick,
+            **homing_options,
         )
         if last is not None:
             logger.warning("Homing interrupted: last target retained, torque preserved; preparation skipped")
@@ -644,8 +672,7 @@ def run(args, stop, backend_factory=DamiaoPreparationBackend, worker_factory=IKW
             last = control_loop(backend, worker, goal, limits, stop, args, mobile)
             if mobile is not None:
                 mobile.write(MOBILE_NEUTRAL_FRAME)
-        logger.info("STOPPING: returning to calibrated arm zero, then disabling torque")
-        # Preserve command continuity and use a separate, slower return duration.
+        logger.info("STOPPING: returning arms to calibrated zero")
         run_motion(
             backend,
             last,
@@ -653,7 +680,6 @@ def run(args, stop, backend_factory=DamiaoPreparationBackend, worker_factory=IKW
             MotionLimits(duration_s=args.lower_duration_s),
             threading.Event(),
             hold=False,
-            tick_callback=startup_tick,
         )
         completed = True
     except Exception:

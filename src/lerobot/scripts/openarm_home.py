@@ -108,10 +108,13 @@ class RecoveryBackend(DamiaoPreparationBackend):
         self.last_positions = dict(positions)
         return positions, velocities  # Tracking and settling always use raw feedback.
 
-    def validate_positions(self, positions, *, measurement=False):
+    def validate_positions(self, positions, *, measurement=False, allow_joint_excursions=False):
         if measurement:
             return self.check_recovery_feedback(positions)
-        return super().validate_positions(positions)
+        return super().validate_positions(
+            positions,
+            allow_joint_excursions=allow_joint_excursions,
+        )
 
 
 def run(args, stop, backend_factory=RecoveryBackend):

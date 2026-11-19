@@ -29,9 +29,11 @@ class MobileMapper:
         self.heading = 0.0
         self.spin_mode = False
         self.previous_click = False
+        self.suppressed_arms = set()
 
     def step(self, controllers, dt):
         left, right = controllers["left"], controllers["right"]
+        self.suppressed_arms = set()
         if not 0 < dt <= 0.1:
             # A delayed input sample must stop motion without changing the
             # wheel target or trying to repair the current configuration.
@@ -47,6 +49,7 @@ class MobileMapper:
         if right.valid and right.grip:
             click = right.stick_pressed and not self.previous_click
             if click:
+                self.suppressed_arms.add("right")
                 self.spin_mode = not self.spin_mode
                 # Keep the translation heading while in spin mode. Switching
                 # back restores that heading instead of forcing wheel-centre.
@@ -59,23 +62,30 @@ class MobileMapper:
                 # Mode selection and rotation are deliberately separate:
                 # B/Y do nothing here; only the right stick commands yaw.
                 yaw = -deadzone(float(right.stick[0]), 0.15)
+                if yaw:
+                    self.suppressed_arms.add("right")
                 speed = round(yaw * self.spin_sign * self.spin * 1000)
             else:
                 if left.valid and not left.grip:
-                    self.heading -= deadzone(float(left.stick[0]), 0.15) * self.steer_sign * 10 * dt
+                    steer = deadzone(float(left.stick[0]), 0.15)
+                    if steer:
+                        self.suppressed_arms.add("right")
+                    self.heading -= steer * self.steer_sign * 10 * dt
                 self.heading = max(-90, min(90, self.heading))
                 angle = round(self.heading)
-                speed = round(deadzone(float(right.stick[1]), 0.15) * self.drive_sign * self.speed * 1000)
+                drive = deadzone(float(right.stick[1]), 0.15)
+                if drive:
+                    self.suppressed_arms.add("right")
+                speed = round(drive * self.drive_sign * self.speed * 1000)
         # Grip release or tracking loss is only a speed deadman. The stored
         # wheel angle and translation/spin flag keep being sent, allowing an
         # in-progress C-board configuration change to finish at its last target.
         self.previous_click = right.valid and right.grip and right.stick_pressed
-        lift_speed = 0
-        lift_enabled = left.valid and left.grip
+        lift_axis = -deadzone(float(left.stick[1]), 0.15) if left.valid and left.grip else 0.0
+        lift_enabled = bool(lift_axis)
         if lift_enabled:
-            lift_speed = round(
-                -deadzone(float(left.stick[1]), 0.15) * self.lift_sign * self.lift_speed * 1000
-            )
+            self.suppressed_arms.add("left")
+        lift_speed = round(lift_axis * self.lift_sign * self.lift_speed * 1000)
         return Commands(
             ChassisFrame(angle, speed, spin),
             LiftFrame(lift_enabled, lift_speed),

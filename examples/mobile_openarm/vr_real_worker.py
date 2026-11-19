@@ -161,6 +161,7 @@ class RealArmTargets:
         self.set_positions(self.display, state["positions"])
         controllers = self.receiver.snapshot()
         mobile_commands = self.mobile.step(controllers, dt)
+        mobile_suppressed = self.mobile.suppressed_arms
         reset_safe = all(c.valid and not c.grip for c in controllers.values())
         if not all(c.valid for c in controllers.values()):
             self.reset_button_armed = False
@@ -197,7 +198,14 @@ class RealArmTargets:
             blocked = set(state.get("blocked_joints", ())) | recovery.keys()
             if side in self.unreachable or any(key.startswith(side + "_") for key in blocked):
                 self.rebase_anchor(side)
-            result = self.sim.step_arm(side, controllers[side], min(0.05, max(0, dt)))
+            if side in mobile_suppressed:
+                # Joystick commands have priority over incidental hand-pose
+                # motion. Hold and rebase so returning the stick to center
+                # resumes arm control without a jump.
+                self.rebase_anchor(side)
+                result = None
+            else:
+                result = self.sim.step_arm(side, controllers[side], min(0.05, max(0, dt)))
             self.unreachable.discard(side)
             if result is not None:
                 # An ordinary joint-rate limit must retain a reachable target
@@ -210,6 +218,7 @@ class RealArmTargets:
             active[side] = bool(
                 not state.get("blocked", False)
                 and not state.get("resetting", False)
+                and side not in mobile_suppressed
                 and c.valid
                 and c.grip
                 and self.sim.armed[side]
@@ -217,6 +226,8 @@ class RealArmTargets:
             reasons[side] = (
                 "limit_hold"
                 if state.get("blocked", False)
+                else "mobile_control"
+                if side in mobile_suppressed
                 else "tracking_lost_or_stale"
                 if not c.valid
                 else "grip_released"
@@ -247,8 +258,6 @@ class RealArmTargets:
             "reason": reasons,
             "reset_id": self.reset_id,
             "reset_safe": reset_safe,
-            # Keep the mobile command on the exact same controller snapshot as
-            # the arm targets. The motor process remains the sole serial owner.
             "mobile_frame": list(mobile_commands.encode()),
             "vr_time": {
                 side: self.receiver.received_at[side] if np.isfinite(self.receiver.received_at[side]) else -1
@@ -266,13 +275,18 @@ def main():
     parser.add_argument("--arm-linear-speed-m-s", type=float, default=0.2)
     parser.add_argument("--arm-angular-speed-deg-s", type=float, default=60)
     parser.add_argument("--vr-filter-scale", type=float, default=0.65)
+    parser.add_argument("--joint-limit-margin-deg", type=float, default=3)
+    parser.add_argument("--ik-j2-motion-weight", type=float, default=DEFAULT_J2_MOTION_WEIGHT)
     parser.add_argument("--mobile-speed", type=float, default=0.05)
     parser.add_argument("--mobile-spin", type=float, default=0.005)
     parser.add_argument("--lift-speed", type=float, default=0.05)
     for name in ("drive", "steer", "spin", "lift"):
-        parser.add_argument(f"--{name}-sign", type=int, choices=(-1, 1), default=-1 if name == "drive" else 1)
-    parser.add_argument("--joint-limit-margin-deg", type=float, default=3)
-    parser.add_argument("--ik-j2-motion-weight", type=float, default=DEFAULT_J2_MOTION_WEIGHT)
+        parser.add_argument(
+            f"--{name}-sign",
+            type=int,
+            choices=(-1, 1),
+            default=-1 if name == "drive" else 1,
+        )
     parser.add_argument("--viewer", action="store_true")
     args = parser.parse_args()
     sock = socket.socket(fileno=args.fd)
@@ -292,10 +306,10 @@ def main():
             mobile_speed=args.mobile_speed,
             mobile_spin=args.mobile_spin,
             lift_speed=args.lift_speed,
-            drive_sign=args.drive_sign,
-            steer_sign=args.steer_sign,
-            spin_sign=args.spin_sign,
-            lift_sign=args.lift_sign,
+            **{
+                f"{name}_sign": getattr(args, f"{name}_sign")
+                for name in ("drive", "steer", "spin", "lift")
+            },
         )
         if args.viewer:
             import mujoco.viewer
